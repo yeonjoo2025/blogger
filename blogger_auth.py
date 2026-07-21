@@ -14,8 +14,8 @@ TOKEN_PATH = Path("token.json")
 CLIENT_SECRET_PATH = Path("client_secret.json")
 
 # Cloud Agent Secrets tab → Runtime Secret / Environment Variable
-TOKEN_ENV_KEYS = ("BLOGGER_TOKEN_JSON", "TOKEN_JSON")
-CLIENT_SECRET_ENV_KEYS = ("BLOGGER_CLIENT_SECRET_JSON", "CLIENT_SECRET_JSON")
+TOKEN_ENV_KEYS = ("BLOGGER_TOKEN", "BLOGGER_TOKEN_JSON", "TOKEN_JSON")
+CLIENT_SECRET_ENV_KEYS = ("BLOGGER_CLIENT_SECRET", "BLOGGER_CLIENT_SECRET_JSON", "CLIENT_SECRET_JSON")
 
 
 def _first_env(*keys: str) -> str | None:
