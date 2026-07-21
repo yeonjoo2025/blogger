@@ -1,27 +1,10 @@
 """Publish a one-off test post to Blogger."""
 
 from datetime import datetime, timezone
-from pathlib import Path
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/blogger"]
-TOKEN_PATH = Path("token.json")
-
-
-def load_credentials() -> Credentials:
-    if not TOKEN_PATH.exists():
-        raise SystemExit("token.json not found. Run: python get_token.py")
-
-    creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
-    if not creds.valid:
-        raise SystemExit("Token invalid. Re-run: python get_token.py")
-    return creds
+from blogger_auth import load_credentials
 
 
 def main() -> None:
