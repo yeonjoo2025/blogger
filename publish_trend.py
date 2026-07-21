@@ -1,4 +1,4 @@
-"""Publish practical guide posts from multi-source trend keywords."""
+"""Publish 1~3 issue-focused informational guides from trend keywords."""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from fetch_trends import (
     select_guide_keywords,
 )
 
+MAX_POSTS = 3
+
 
 def _execute_with_retry(request, retries: int = 5):
     delay = 8
@@ -35,235 +37,187 @@ def _execute_with_retry(request, retries: int = 5):
             raise
 
 
-def _guide_title(keyword: str) -> str:
-    """SEO-style practical title focused on method / detailed guide."""
+def _issue_frame(keyword: str) -> dict[str, str]:
+    """Return issue / impact / methods / solutions framing for a keyword."""
     k = keyword.strip()
+
     if re.search(r"근저당", k):
-        return "근저당이란? 뜻·설정 방법·말소 절차 상세 안내"
-    if re.search(r"회생법원", k):
-        return f"{k} 개인회생 신청 전 확인사항·절차 상세 안내"
-    if re.search(r"회생|파산|항고", k):
-        return f"{k} 뜻과 대응 방법·절차 총정리"
-    if re.search(r"사이드카|코스피|주가|주식|주주", k):
-        return f"{k} 의미와 투자자가 확인할 점 상세 해설"
-    if re.search(r"쿠팡|물류.*화재|화재.*물류", k):
-        return "쿠팡 물류센터 화재 현황과 피해·안전 대응 방법 안내"
+        return {
+            "title": "근저당 설정되면 뭐가 문제일까? 영향과 말소·대응 방법",
+            "issue": "근저당은 부동산에 채무 담보를 설정하는 권리입니다. 대출·보증과 함께 등기되면, 매매·추가 대출·상속 때 즉시 문제가 됩니다.",
+            "impact": "집이 담보로 묶여 매도가 어려워지고, 채무 불이행 시 경매 위험이 커지며, 후순위 대출 한도에도 영향을 줍니다.",
+            "methods": [
+                "등기사항전부증명서에서 근저당권자·채권최고액·설정일을 확인한다",
+                "대출 잔액과 채권최고액 차이를 계산해 실제 부담 규모를 파악한다",
+                "매매·대환·상속 예정일이 있으면 말소 가능 시점을 미리 잡는다",
+            ],
+            "solutions": [
+                "대출 상환 후 금융기관에 말소 서류 발급을 요청한다",
+                "법무사·은행을 통해 말소 등기를 진행한다",
+                "금액·기한이 복잡하면 계약 전 전문가 검토로 분쟁을 막는다",
+            ],
+        }
+
+    if re.search(r"회생법원|개인회생|회생절차|즉시항고", k):
+        return {
+            "title": f"{k} 이슈 정리: 누구에게 영향이 있고 어떻게 대응할까",
+            "issue": f"‘{k}’ 검색이 늘었다는 것은 채무 조정·회생 절차에 대한 실무 확인 수요가 커졌다는 신호입니다. 핵심은 ‘자격이 되는지’와 ‘지금 어떤 절차를 밟아야 하는지’입니다.",
+            "impact": "소득·재산 처분, 채권자 추심, 신용도, 주거·사업 유지에 직접 영향을 줍니다. 기한을 놓치면 항고·이의 기회를 잃을 수 있습니다.",
+            "methods": [
+                "내 채무 목록·소득·필수생계비를 표로 정리한다",
+                "법원·공식 안내에서 신청 요건과 제출 서류를 확인한다",
+                "관련 결정문·공고문의 기한(항고·이의)을 달력에 표시한다",
+            ],
+            "solutions": [
+                "요건이 맞으면 서류 보완 후 정식 신청/대응을 진행한다",
+                "즉시항고·이의 기한이 있으면 늦지 않게 접수한다",
+                "혼자 판단이 어려우면 신용회복·법률구조·변호사 상담을 우선한다",
+            ],
+        }
+
+    if re.search(r"쿠팡|물류.*화재|화재.*물류|화재", k):
+        return {
+            "title": "쿠팡 물류센터 화재, 지금 이슈와 영향·대처 방법",
+            "issue": "대형 물류센터 화재는 단순 사고가 아니라 인근 주민 안전, 배송 차질, 근로·보상 이슈가 한꺼번에 불거지는 사건입니다.",
+            "impact": "대피·교통 통제, 배송 지연, 근로자 안전, 잔불/붕괴 위험, 추후 원인 조사와 보상 절차에 영향을 미칩니다.",
+            "methods": [
+                "소방·지자체·기업 공식 발표로 초진/잔불/대피 상태를 확인한다",
+                "거주·근무지가 영향권인지 공지와 지도로 점검한다",
+                "피해가 있으면 사진·영수증·공지 캡처 등 증빙을 남긴다",
+            ],
+            "solutions": [
+                "위험 지역이면 대피·우회 지침을 따른다",
+                "근로·배송 피해는 회사 공지와 상담 채널로 접수한다",
+                "보상·산재 가능성이 있으면 관련 기관 상담을 진행한다",
+            ],
+        }
+
     if re.search(r"이관개방", k):
-        return "이관개방증 증상·원인·대처 방법 상세 정리"
-    if re.search(r"독사", k):
-        return "독사 물렸을 때 증상 확인과 응급 대처 방법 상세 안내"
+        return {
+            "title": "이관개방증이란? 증상 영향과 대처 방법",
+            "issue": "이관개방증은 귀와 코를 잇는 이관이 과도하게 열려 내 목소리가 울리거나 귀가 막힌 듯한 증상이 생기는 상태입니다.",
+            "impact": "대화·업무 집중이 어렵고, 비행·다이어트·스트레스 상황에서 증상이 악화될 수 있습니다. 방치하면 생활 품질이 크게 떨어집니다.",
+            "methods": [
+                "증상(자가발성증, 이충만감)과 발생 상황을 기록한다",
+                "체중 변화·비염·스트레스 등 유발 요인을 점검한다",
+                "신뢰할 수 있는 이비인후과 정보로 유사 질환과 구분한다",
+            ],
+            "solutions": [
+                "일상 지장이 있으면 이비인후과 진료를 받는다",
+                "임의로 약·시술을 결정하지 말고 진료 후 치료 계획을 따른다",
+                "악화 요인(급격한 체중 변화, 코 풀기 습관 등)을 조절한다",
+            ],
+        }
+
+    if re.search(r"주가|주식|사이드카|코스피|주주", k):
+        return {
+            "title": f"{k} 이슈 해설: 시장 영향과 투자자 대응 방법",
+            "issue": f"‘{k}’는 가격 급변, 거래 규정, 기업 이슈가 겹칠 때 검색이 몰립니다. 무엇을 사라는 신호가 아니라, ‘무슨 일이 생겼는지’를 확인해야 하는 키워드입니다.",
+            "impact": "보유 종목 평가손익, 예약주문 체결, 신용/미수 위험, 변동성 확대에 영향을 줍니다.",
+            "methods": [
+                "공시·거래소·증권사 공식 설명으로 이슈 정의를 확인한다",
+                "내 보유 종목·주문·레버리지 상태를 점검한다",
+                "단기 커뮤니티 정보와 공식 데이터를 분리해서 본다",
+            ],
+            "solutions": [
+                "근거 없는 추격 매수/패닉 매도를 피한다",
+                "리스크가 크면 비중·주문 조건을 먼저 조정한다",
+                "장기 판단은 공시와 실적 중심으로 재검토한다",
+            ],
+        }
+
     if re.search(r"은행|대출|금리|보험|세금", k):
-        return f"{k} 이용·확인 방법 상세 가이드"
-    if re.search(r"항공|항공권|비자", k):
-        return f"{k} 예약·이용 전 꼭 확인할 점 안내"
-    if re.search(r"SQLD|자격|시험|취업", k, re.I):
-        return f"{k} 준비 방법과 일정·합격 포인트 안내"
-    if re.search(r"국토교통|법원|신청|절차", k):
-        return f"{k} 업무 처리 방법 상세 안내"
-    if len(k) <= 8:
-        return f"{k} 핵심 의미와 실무 확인 방법 상세 안내"
-    return f"{k} 핵심 정리와 실무 확인 방법"
+        return {
+            "title": f"{k} 이슈와 영향, 지금 확인할 방법·해결 포인트",
+            "issue": f"‘{k}’ 검색 증가는 수수료·금리·한도·청구·정책 변화처럼 돈과 직결된 확인 수요가 커졌다는 뜻입니다.",
+            "impact": "이자 부담, 승인 여부, 연체, 환급/청구 금액에 바로 영향을 줄 수 있습니다.",
+            "methods": [
+                "공식 앱·홈페이지 공지에서 변경 내용을 확인한다",
+                "내 계약 조건(금리, 한도, 만기, 중도상환)을 다시 본다",
+                "필요 서류와 신청/해지 경로를 정리한다",
+            ],
+            "solutions": [
+                "불리한 조건이면 대환·조건 변경·상담을 검토한다",
+                "오류 청구·연체 위험이 있으면 즉시 고객센터에 접수한다",
+                "금액이 크면 실행 전 조건을 문서로 남긴다",
+            ],
+        }
+
+    # Generic but still issue-structured
+    return {
+        "title": f"{k}, 무슨 이슈일까? 영향과 대응 방법 정리",
+        "issue": f"‘{k}’는 현재 검색량이 늘어난 실무·생활 이슈 키워드입니다. 제목만 보지 말고, 무엇이 쟁점인지부터 정의해야 합니다.",
+        "impact": "관련 비용, 일정, 자격, 안전, 계약 조건 중 하나 이상에 영향을 줄 수 있습니다.",
+        "methods": [
+            "공식 출처에서 이슈의 정의를 확인한다",
+            "나에게 해당하는 조건(지역·금액·기한·자격)을 적는다",
+            "필요한 서류·비용·연락 채널을 정리한다",
+        ],
+        "solutions": [
+            "조건이 맞으면 신청·변경·상담 등 실행 절차로 넘어간다",
+            "기한이 있으면 우선순위를 높여 처리한다",
+            "판단이 어렵거나 금액이 크면 전문가·공식 상담을 이용한다",
+        ],
+    }
 
 
-def _topic_bucket(keyword: str) -> str:
-    k = keyword.lower()
-    if re.search(r"근저당|회생|파산|법원|압류|경매", k):
-        return "법률·금융"
-    if re.search(r"주가|주식|코스피|사이드카|주주|이더리움|비트코인|환율", k):
-        return "투자·자산"
-    if re.search(r"화재|물류|대피|산재|안전", k):
-        return "생활·안전"
-    if re.search(r"은행|대출|금리|보험|세금|카드", k):
-        return "금융생활"
-    if re.search(r"증상|질환|이관|치료|병원|검진", k):
-        return "건강정보"
-    if re.search(r"자격|시험|sqld|취업|이직", k):
-        return "취업·자격"
-    if re.search(r"항공|비자|여행|관광", k):
-        return "여행·교통"
-    return "실용정보"
-
-
-def _build_guide_sections(keyword: str, news: list[dict[str, str]]) -> str:
-    topic = _topic_bucket(keyword)
-    k = escape(keyword)
-
-    news_html = ""
-    if news:
-        lis = []
-        for article in news[:5]:
-            source = f" ({escape(article['source'])})" if article.get("source") else ""
-            if article.get("link"):
-                lis.append(
-                    f"<li><a href=\"{escape(article['link'])}\">{escape(article['title'])}</a>{source}</li>"
-                )
-            else:
-                lis.append(f"<li>{escape(article['title'])}{source}</li>")
-        news_html = f"<ul>{''.join(lis)}</ul>"
-    else:
-        news_html = "<p>관련 최신 헤드라인이 제한적입니다. 공식 기관·1차 자료를 우선 확인하세요.</p>"
-
-    # Topic-specific practical bodies
-    if topic == "법률·금융":
-        body = f"""
-<h2>{k} 개념 한눈에 보기</h2>
-<p><strong>{k}</strong>는 재산·채무·담보와 직접 연결되는 키워드입니다.
-검색이 몰릴 때는 계약·대출·부동산 거래 과정에서 권리관계가 걸린 경우가 많습니다.
-용어 뜻을 먼저 정확히 이해한 뒤, 본인 상황에 맞는 절차를 순서대로 확인하는 것이 중요합니다.</p>
-
-<h2>왜 지금 검색이 늘어날까</h2>
-<p>금리·부동산·개인 채무 이슈가 겹치면 관련 용어 검색이 급증합니다.
-단순 호기심보다 ‘내 계약서에 불리한 조항이 있는지’, ‘신청 자격이 되는지’처럼
-실무 확인 수요가 함께 붙는 편이 일반적입니다.</p>
-
-<h2>확인·진행 방법</h2>
-<ol>
-  <li><strong>내 서류부터 확인</strong> — 등기사항전부증명서, 계약서, 대출약정서, 법원 문서를 모읍니다.</li>
-  <li><strong>공식 기준 확인</strong> — 법원·정부24·금융기관 안내처럼 1차 출처의 정의와 요건을 봅니다.</li>
-  <li><strong>일정·비용 체크</strong> — 신청 기한, 인지대/수수료, 필요 서류 목록을 표로 정리합니다.</li>
-  <li><strong>전문가 상담 기준 정하기</strong> — 금액이 크거나 기한이 임박하면 변호사·법무사·신용상담과 상의합니다.</li>
-</ol>
-
-<h2>실무 체크리스트</h2>
-<ul>
-  <li>내 이름이 권리자/의무자로 어디에 기재돼 있는지</li>
-  <li>담보·보증·연대입보 범위가 어디까지인지</li>
-  <li>말소·변경·신청 가능 시점</li>
-  <li>상담 전 질문 3가지를 미리 적을 것</li>
-</ul>
-"""
-    elif topic == "투자·자산":
-        body = f"""
-<h2>{k}란 무엇인가</h2>
-<p><strong>{k}</strong>는 시장 변동과 투자 판단에 쓰이는 키워드입니다.
-검색량이 갑자기 커질 때는 지수 급변, 매매 규정 발동, 개별 종목 이슈가 겹친 경우가 많습니다.</p>
-
-<h2>투자 전 꼭 볼 포인트</h2>
-<ol>
-  <li><strong>용어 정의</strong> — 뉴스 제목만 보지 말고, 거래소·증권사 가이드의 공식 설명을 확인합니다.</li>
-  <li><strong>발동/발표 조건</strong> — 사이드카·서킷브레이커·공시처럼 조건과 해제 시점을 구분합니다.</li>
-  <li><strong>내 포지션 영향</strong> — 보유 종목, 예약주문, 미수/신용 여부까지 함께 점검합니다.</li>
-  <li><strong>검증된 정보만</strong> — 카톡발·단톡발 급등 정보보다 공시와 정규 시세 데이터를 우선합니다.</li>
-</ol>
-
-<h2>초보자가 실수하기 쉬운 점</h2>
-<ul>
-  <li>검색 상위 = 매수 신호로 오해하기</li>
-  <li>단기 변동만 보고 레버리지 확대하기</li>
-  <li>수수료·세금·스프레드를 무시하기</li>
-</ul>
-"""
-    elif topic == "건강정보":
-        body = f"""
-<h2>{k} 기본 정보</h2>
-<p><strong>{k}</strong>는 증상·질환 관련 검색어입니다.
-갑자기 검색이 늘면 유명인 사례, 계절성 질환, 혹은 관련 콘텐츠 확산이 원인인 경우가 있습니다.
-자가진단으로 단정하지 말고, 아래 순서로 정보를 정리해 보세요.</p>
-
-<h2>증상 이해와 대처 순서</h2>
-<ol>
-  <li>주요 증상과 지속 시간을 메모합니다.</li>
-  <li>악화 요인(자세, 비행, 감기, 스트레스 등)이 있었는지 기록합니다.</li>
-  <li>신뢰할 수 있는 의학 정보(병원 공식 콘텐츠, 전문의 칼럼)로 개념을 확인합니다.</li>
-  <li>일상생활 지장·통증·재발이 있으면 이비인후과 등 관련 진료과 상담을 고려합니다.</li>
-</ol>
-
-<h2>주의할 점</h2>
-<ul>
-  <li>검색 후기만으로 약 복용·시술을 결정하지 않기</li>
-  <li>응급 증상(급격한 청력 저하, 심한 어지럼, 호흡곤란 등)은 즉시 진료</li>
-  <li>광고성 ‘특효’ 콘텐츠와 의학 정보를 구분하기</li>
-</ul>
-"""
-    elif topic == "취업·자격":
-        body = f"""
-<h2>{k} 준비 전에 확인할 것</h2>
-<p><strong>{k}</strong>는 자격·채용·시험 관련 실무 키워드입니다.
-검색이 몰릴 때는 접수 일정, 시험 개편, 채용 시즌이 겹치는 경우가 많습니다.</p>
-
-<h2>합격·취업으로 이어가는 방법</h2>
-<ol>
-  <li><strong>공식 일정 확인</strong> — 주관처 공고의 원서 접수, 시험일, 합격 발표일을 캘린더에 고정합니다.</li>
-  <li><strong>출제 범위 정리</strong> — 과목별 비중과 최근 개정 사항을 표로 만듭니다.</li>
-  <li><strong>학습 루틴</strong> — 주 단위로 이론/문제풀이 비율을 나누고, 모의고사 오답노트를 남깁니다.</li>
-  <li><strong>비용·교재 예산</strong> — 응시료, 강의, 교재 비용을 미리 책정합니다.</li>
-</ol>
-"""
-    elif topic == "생활·안전":
-        body = f"""
-<h2>{k} 이슈 정리</h2>
-<p><strong>{k}</strong>는 안전·재난·생활 리스크와 연결된 검색어입니다.
-대형 사고나 화재 이슈가 있으면 원인, 피해 범위, 보상, 대피 요령을 한꺼번에 찾는 흐름이 나타납니다.</p>
-
-<h2>상황별 확인 방법</h2>
-<ol>
-  <li>공식 발표(소방·지자체·기업 공지)로 현재 상태를 확인합니다.</li>
-  <li>거주·근무 위치가 영향권인지 지도/공지로 점검합니다.</li>
-  <li>대피·교통·출근 지침이 있는지 확인합니다.</li>
-  <li>피해가 있다면 증빙(사진, 영수증, 공지 캡처)을 남겨 상담·보상 절차에 대비합니다.</li>
-</ol>
-"""
-    else:
-        body = f"""
-<h2>{k}를 찾는 사람들이 궁금한 것</h2>
-<p><strong>{k}</strong>는 현재 검색량이 늘어난 실용 키워드입니다.
-단순 이슈 소비보다, 개념 이해 → 내 상황 대입 → 실행 체크 순서로 보면
-실제 의사결정에 도움이 됩니다.</p>
-
-<h2>상세 확인 방법</h2>
-<ol>
-  <li>키워드의 기본 정의를 공식 출처에서 확인합니다.</li>
-  <li>나에게 해당하는 조건(자격, 지역, 금액, 일정)을 적습니다.</li>
-  <li>필요한 서류·비용·소요 시간을 표로 정리합니다.</li>
-  <li>마지막으로 최신 뉴스/공지와 교차 검증합니다.</li>
-</ol>
-"""
-
-    return f"""
-{body}
-<h2>최근 관련 소식</h2>
-{news_html}
-<h2>자주 묻는 질문</h2>
-<ul>
-  <li><strong>검색이 많다는 건 지금 해야 한다는 뜻인가요?</strong> —
-  관심 증가는 신호일 뿐입니다. 본인 조건과 공식 기준을 먼저 보세요.</li>
-  <li><strong>어디에 나온 정보를 믿어야 하나요?</strong> —
-  정부·법원·거래소·해당 기업 공지 등 1차 출처를 우선하세요.</li>
-  <li><strong>혼자 해결이 어려우면?</strong> —
-  금액·기한·법적 효과가 큰 사안은 전문가 상담이 비용 대비 안전합니다.</li>
-</ul>
-""".strip()
+def _news_html(news: list[dict[str, str]]) -> str:
+    if not news:
+        return "<p>관련 최신 헤드라인이 제한적입니다. 공식 발표를 우선 확인하세요.</p>"
+    lis = []
+    for article in news[:4]:
+        source = f" ({escape(article['source'])})" if article.get("source") else ""
+        if article.get("link"):
+            lis.append(
+                f"<li><a href=\"{escape(article['link'])}\">{escape(article['title'])}</a>{source}</li>"
+            )
+        else:
+            lis.append(f"<li>{escape(article['title'])}{source}</li>")
+    return f"<ul>{''.join(lis)}</ul>"
 
 
 def build_post(item: TrendItem, now: str) -> tuple[str, str, list[str]]:
     keyword = item.title
-    title = _guide_title(keyword)
-    news = fetch_news_headlines(keyword, limit=5)
-    sections = _build_guide_sections(keyword, news)
-    sources = (
-        f"<li><a href=\"{escape(SOURCE_URLS['google'])}\">Google Trends KR</a> ({escape(item.window)})</li>"
-        f"<li><a href=\"{escape(SOURCE_URLS['blackkiwi'])}\">BlackKiwi 트렌드</a></li>"
-        f"<li><a href=\"{escape(SOURCE_URLS['loword'])}\">Loword 키워드 트렌드</a></li>"
-    )
+    frame = _issue_frame(keyword)
+    news = fetch_news_headlines(keyword, limit=4)
+
+    methods = "".join(f"<li>{escape(step)}</li>" for step in frame["methods"])
+    solutions = "".join(f"<li>{escape(step)}</li>" for step in frame["solutions"])
+
+    title = frame["title"]
     content = f"""
-<p>지금 검색량이 늘어난 <strong>{escape(keyword)}</strong>에 대해
-뜻과 확인 포인트, 실무에서 쓰는 방법을 중심으로 정리했습니다.
-엔터테인먼트성 이슈가 아니라, 실제로 돈이 되거나 궁금해서 찾아볼 만한
-정보성 관점으로 구성했습니다.</p>
+<p><strong>한 줄 요약:</strong> {escape(frame["issue"])}</p>
 
-<p><strong>수집 기준:</strong> {escape(item.source)} · {escape(item.window)} ·
-{escape(item.volume_label)}
-{" · 활성" if item.active else ""}</p>
+<h2>1. 이슈가 무엇인가</h2>
+<p>{escape(frame["issue"])}</p>
+<p>현재 수집 기준: {escape(item.source)} · {escape(item.window)} · {escape(item.volume_label)}</p>
 
-{sections}
+<h2>2. 무엇이 영향받는가</h2>
+<p>{escape(frame["impact"])}</p>
 
-<h2>데이터 출처</h2>
+<h2>3. 관련해서 확인할 방법</h2>
+<ol>
+{methods}
+</ol>
+
+<h2>4. 해결·대응 방법</h2>
+<ol>
+{solutions}
+</ol>
+
+<h2>5. 관련 소식</h2>
+{_news_html(news)}
+
+<h2>참고 출처</h2>
 <ul>
-{sources}
+  <li><a href="{escape(SOURCE_URLS['google'])}">Google Trends KR</a></li>
+  <li><a href="{escape(SOURCE_URLS['blackkiwi'])}">BlackKiwi 트렌드</a></li>
+  <li><a href="{escape(SOURCE_URLS['loword'])}">Loword 키워드 트렌드</a></li>
 </ul>
 <p>작성 시각: {escape(now)}</p>
 """.strip()
-    labels = ["정보성", "상세안내", _topic_bucket(keyword), keyword[:40], "트렌드키워드"]
+
+    labels = ["이슈정리", "정보성", "해결방법", keyword[:40]]
     return title, content, labels
 
 
@@ -336,7 +290,7 @@ def _upsert_post(
 
 def main() -> None:
     collected = collect_all_sources()
-    keywords = select_guide_keywords(collected, limit=8)
+    keywords = select_guide_keywords(collected, limit=MAX_POSTS)
     if not keywords:
         raise SystemExit("No informational keywords selected.")
 
@@ -349,17 +303,15 @@ def main() -> None:
     blog = items[0]
     blog_id = blog["id"]
     print(f"Using blog: {blog.get('name')} ({blog_id})")
+    print(f"Publishing up to {MAX_POSTS} issue guides.")
 
     now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
     recent = _execute_with_retry(
         service.posts().list(blogId=blog_id, maxResults=50, fetchBodies=False)
     )
-    keep_fragments = [item.title[:8] for item in keywords] + ["상세 안내", "총정리", "상세 정리", "상세 해설", "상세 가이드"]
     recycle_ids = []
     for post in recent.get("items") or []:
         title = post.get("title") or ""
-        if any(frag and frag in title for frag in keep_fragments):
-            continue
         if title.startswith("[검색량 TOP5]") or "이슈 TOP" in title or "여행 트렌드" in title:
             recycle_ids.append(post["id"])
     print(f"Recycle candidates: {len(recycle_ids)}")
@@ -380,7 +332,7 @@ def main() -> None:
         print(f"{action.upper()}: {title} -> {url}")
         time.sleep(2)
 
-    print(f"Done. {len(results)} guide posts.")
+    print(f"Done. {len(results)} issue posts.")
 
 
 if __name__ == "__main__":
