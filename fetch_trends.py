@@ -26,12 +26,23 @@ class TrendItem:
 
 
 def _parse_volume(label: str) -> int:
-    text = label.replace(",", "").replace("searches", "").strip()
-    match = re.match(r"(\d+(?:\.\d+)?)([KkMm]?)\+?", text)
-    if not match:
+    """Parse labels like '5K+', '검색 5천+회', '검색 500+회'."""
+    text = unescape(label).replace(",", "").strip()
+    korean = re.search(r"(\d+(?:\.\d+)?)\s*(천|만)?\+?", text)
+    if korean and ("검색" in text or "회" in text or "천" in text or "만" in text):
+        value = float(korean.group(1))
+        unit = korean.group(2) or ""
+        if unit == "천":
+            value *= 1_000
+        elif unit == "만":
+            value *= 10_000
+        return int(value)
+
+    english = re.search(r"(\d+(?:\.\d+)?)([KkMm]?)\+?", text)
+    if not english:
         return 0
-    value = float(match.group(1))
-    unit = match.group(2).lower()
+    value = float(english.group(1))
+    unit = english.group(2).lower()
     if unit == "k":
         value *= 1_000
     elif unit == "m":
@@ -56,11 +67,15 @@ def fetch_trends_by_search_volume(limit: int = 15) -> list[TrendItem]:
         if not title_match or not volume_match:
             continue
         title = unescape(title_match.group(1)).strip()
-        volume_label = unescape(volume_match.group(1)).replace(" searches", "").strip()
+        volume_label = unescape(volume_match.group(1)).strip()
+        volume_label = volume_label.replace(" searches", "").replace("searches", "").strip()
         preview = chunk[:2500]
-        active = "Active" in preview and "Lasted" not in preview[:400]
-        if "Lasted" in preview[:800] and "Active" not in preview[:400]:
+        if "활성" in preview or "Active" in preview:
+            active = True
+        elif "지속됨" in preview or "Lasted" in preview:
             active = False
+        else:
+            active = "trending_up" in preview
         items.append(
             TrendItem(
                 rank=index,

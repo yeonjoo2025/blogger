@@ -87,8 +87,9 @@ def build_post(trends: list[TrendItem], now: str) -> tuple[str, str, list[str]]:
 물류·유통업계에서는 안전관리와 복층 적재 구조 규제 논의가
 다시 수면 위로 오른 상태입니다.</p>
 
-<h2>신진서 · 바둑 AI 카타고 역전승</h2>
-<p>바둑 세계 랭킹 1위 <strong>신진서 9단</strong>이 21일
+<h2>카타고 · 신진서의 AI 대결 역전승</h2>
+<p>관련 검색어 <strong>카타고</strong>·신진서가 상위에 함께 오르고 있습니다.
+바둑 세계 랭킹 1위 <strong>신진서 9단</strong>이 21일
 ‘쎈수학·한경 기신전’ 최종 3국에서 바둑 AI <strong>카타고(KataGo)</strong>를
 221수 만에 흑 11집 반으로 꺾었습니다.
 1국 패배 뒤 2국·3국을 연속으로 잡아내 최종 전적 <strong>2승 1패</strong>로 시리즈를 마무리했습니다.</p>
