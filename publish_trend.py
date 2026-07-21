@@ -25,22 +25,22 @@ Pipeline:
      just 6/day on this brand-new blog). Because the real number varies and
      isn't discoverable in advance, we only use MAX_NEW_POSTS_PER_DAY
      (default 50, override with BLOGGER_MAX_NEW_POSTS_PER_DAY) as an upper
-     bound to skip an obviously-doomed insert call; the moment Blogger
-     actually returns 403/429, we treat that as *today's* real limit and
-     switch to updating the oldest existing post instead for the rest of
-     the run (and re-checked fresh next run, so a blog that matures past
-     its early throttling is picked up automatically without a code
-     change).
+     bound to skip an obviously-doomed insert call. The moment Blogger
+     returns 403/429 (or the assumed quota is already exhausted), this run
+     stops publishing entirely - no new posts and no updates of old posts -
+     and waits for the next cron cycle when quota may have reset.
 
 Run: python3 publish_trend.py
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -61,6 +61,7 @@ from trend_sources import KST, TrendItem, collect_all_trends, fetch_related_news
 DEDUPE_LOOKBACK_HOURS = 20
 NEWS_PER_CANDIDATE = 15
 NEWS_SHOWN_IN_POST = 6
+QUOTA_STATE_PATH = Path(".blogger_quota_state.json")
 
 # Editorial cap: how many topics we're willing to write about per run. This
 # is a *content quality* decision ("가장 이슈가 되는 것만 작성, 애매하면
@@ -264,12 +265,36 @@ def select_final_topics(
     return final
 
 
+def _today_kst_key(now: datetime) -> str:
+    return now.astimezone(KST).date().isoformat()
+
+
+def load_quota_exhausted_today(now: datetime) -> bool:
+    """Return True if a previous run already saw today's new-post quota hit."""
+    if not QUOTA_STATE_PATH.exists():
+        return False
+    try:
+        data = json.loads(QUOTA_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(data.get("exhausted")) and data.get("date") == _today_kst_key(now)
+
+
+def mark_quota_exhausted_today(now: datetime, observed_count: int) -> None:
+    payload = {
+        "date": _today_kst_key(now),
+        "exhausted": True,
+        "observed_new_posts": observed_count,
+        "marked_at": now.astimezone(KST).isoformat(),
+    }
+    QUOTA_STATE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def count_new_posts_today(recent_posts: list[dict], now: datetime) -> int:
     """Count posts whose original publish date falls on today's KST date.
 
-    Falling back to updating an old post never changes its ``published``
-    timestamp, so this only counts genuinely *new* posts created today -
-    exactly what Blogger's daily new-post quota cares about.
+    This only counts genuinely *new* posts created today - exactly what
+    Blogger's daily new-post quota cares about.
     """
     today_kst = now.astimezone(KST).date()
     count = 0
@@ -291,11 +316,6 @@ def publish_new_post(service, blog_id: str, title: str, content: str) -> dict:
     return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
 
 
-def update_old_post(service, blog_id: str, post_id: str, title: str, content: str) -> dict:
-    body = {"kind": "blogger#post", "blog": {"id": blog_id}, "id": post_id, "title": title, "content": content}
-    return service.posts().update(blogId=blog_id, postId=post_id, body=body).execute()
-
-
 def main() -> None:
     now = datetime.now(timezone.utc)
 
@@ -311,7 +331,23 @@ def main() -> None:
     log(f"using blog: {blog.get('name', '(unnamed)')} ({blog_id})")
 
     recent_posts = list_all_live_posts(service, blog_id)
-    log(f"fetched {len(recent_posts)} existing live posts for dedupe/fallback")
+    log(f"fetched {len(recent_posts)} existing live posts for dedupe")
+
+    new_posts_today = count_new_posts_today(recent_posts, now)
+    remaining_quota = max(0, MAX_NEW_POSTS_PER_DAY - new_posts_today)
+    log(
+        f"new posts published today (KST): {new_posts_today}/{MAX_NEW_POSTS_PER_DAY} "
+        f"-> {remaining_quota} new-post slot(s) left for this run"
+    )
+    if remaining_quota <= 0 or load_quota_exhausted_today(now):
+        if remaining_quota > 0:
+            log(
+                "a previous run already hit today's new-post quota (403/429) - "
+                "stopping without creating or updating posts"
+            )
+        else:
+            log("daily new-post quota already used up - stopping without creating or updating posts")
+        return
 
     candidates = build_candidates(now)
     log(f"{len(candidates)} candidates qualified after news-grounded filtering")
@@ -321,66 +357,37 @@ def main() -> None:
         log("no topic clearly qualifies this run (ambiguous or already covered) - publishing nothing")
         return
 
-    oldest_posts = sorted(recent_posts, key=lambda p: p.get("published") or "")
-    fallback_used = False
-
-    new_posts_today = count_new_posts_today(recent_posts, now)
-    remaining_quota = max(0, MAX_NEW_POSTS_PER_DAY - new_posts_today)
-    log(
-        f"new posts published today (KST): {new_posts_today}/{MAX_NEW_POSTS_PER_DAY} "
-        f"-> {remaining_quota} new-post slot(s) left for this run"
-    )
-
-    def update_oldest_instead(title: str, content: str) -> None:
-        nonlocal fallback_used
-        fallback_used = True
-        target = None
-        for candidate_post in oldest_posts:
-            if candidate_post.get("id"):
-                target = candidate_post
-                break
-        if target is None:
-            log("  no existing post available to update; skipping this topic")
-            return
-        oldest_posts.remove(target)
-        try:
-            updated = update_old_post(service, blog_id, target["id"], title, content)
-            log(f"  updated old post instead: {updated.get('url')}")
-        except HttpError as exc2:
-            log(f"  update fallback also failed (HTTP {getattr(exc2.resp, 'status', '?')})")
-
+    published_count = 0
     for idx, topic in enumerate(final_topics, start=1):
+        if remaining_quota <= 0:
+            log("daily new-post quota used up mid-run - stopping without further create/update")
+            break
+
         title = build_title(topic.keyword, topic.category)
         content = build_body_html(topic.keyword, topic.category, topic.news)
         log(f"[{idx}/{len(final_topics)}] '{title}' (category={topic.category})")
-
-        if remaining_quota <= 0:
-            log("  daily new-post quota already used up; updating an old post instead of trying to insert")
-            update_oldest_instead(title, content)
-            if idx < len(final_topics):
-                time.sleep(2)
-            continue
 
         try:
             post = publish_new_post(service, blog_id, title, content)
             log(f"  published: {post.get('url')}")
             remaining_quota -= 1
+            published_count += 1
+            new_posts_today += 1
         except HttpError as exc:
             status = getattr(exc.resp, "status", None)
             if status in (403, 429):
-                log(f"  new post blocked (HTTP {status}); daily quota reached earlier than expected")
-                remaining_quota = 0
-                update_oldest_instead(title, content)
-            else:
-                log(f"  publish failed (HTTP {status}), skipping this topic")
+                mark_quota_exhausted_today(now, new_posts_today)
+                log(
+                    f"  new post blocked (HTTP {status}); marking today's quota exhausted "
+                    f"and stopping without creating or updating further posts"
+                )
+                break
+            log(f"  publish failed (HTTP {status}), skipping this topic")
 
-        if idx < len(final_topics):
+        if idx < len(final_topics) and remaining_quota > 0:
             time.sleep(2)
 
-    if fallback_used:
-        log("run finished with at least one fallback update due to new-post restrictions")
-    else:
-        log("run finished")
+    log(f"run finished - published {published_count} new post(s)")
 
 
 if __name__ == "__main__":

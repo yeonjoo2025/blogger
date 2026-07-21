@@ -265,31 +265,142 @@ def fetch_loword_keyword_trend() -> list[TrendItem]:
     return items
 
 
-_BLACKKIWI_ITEM_RE = re.compile(r"(\d{1,2})\s+([가-힣A-Za-z0-9][^\d]{1,40}?)(?=\s+\d{1,2}\s|\s*$)")
+BLACKKIWI_ISSUE_KEYWORDS_API = "https://blackkiwi.net/api/service/keyword/issue-keywords"
+BLACKKIWI_NEW_KEYWORDS_API = "https://blackkiwi.net/api/service/keyword/new-keywords"
+
+# The Trend page UI exposes 일간 / 주간 / 월간 tabs. The frontend calls
+# /api/service/keyword/issue-keywords?periodType=... for those, and
+# /api/service/keyword/new-keywords for the "새롭게 등장한 키워드" panel.
+# We pull daily + hourly (when they differ) as 24h / 1h signals, plus the
+# newest-keyword list as an additional 24h signal.
+_BLACKKIWI_PERIOD_WINDOWS = (
+    ("daily", ("24h",)),
+    ("hourly", ("1h", "24h")),
+)
+
+
+def _blackkiwi_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": UA,
+            "Accept": "application/json, text/plain, */*",
+            "Referer": BLACKKIWI_URL,
+            "Origin": "https://blackkiwi.net",
+        }
+    )
+    try:
+        # Warm cookies the same way a browser would before calling the API.
+        session.get(BLACKKIWI_URL, timeout=HTTP_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"blackkiwi: warm-up GET failed: {exc}")
+    return session
 
 
 def fetch_blackkiwi_trend() -> list[TrendItem]:
-    """blackkiwi.net daily rising-keyword ranking (best effort).
+    """blackkiwi.net rising + newly-appeared keyword rankings via JSON API.
 
-    The ranking list appears to require a signed-in session / renders the
-    top spots without plain text in anonymous mode, so this frequently
-    returns an empty list. That is fine: it is one of three sources and the
-    pipeline is designed to keep working with whichever sources succeed.
+    Uses the same undocumented but publicly reachable frontend endpoints the
+    Trend page itself calls (no headless Chrome, no login required):
+      - /api/service/keyword/issue-keywords?periodType=daily|hourly
+      - /api/service/keyword/new-keywords
+    Falls back to an empty list on any failure so other sources can still run.
     """
     items: list[TrendItem] = []
-    html = _render_with_headless_chrome(BLACKKIWI_URL, wait_ms=9000)
-    if not html:
-        _log("blackkiwi: headless render returned nothing")
-        return items
+    session = _blackkiwi_session()
 
-    text = _html_to_flat_text(html)
-    block = _extract_between(text, "인기 급상승 키워드 일간", "AI 트렌드 인사이트")
-    for m in _BLACKKIWI_ITEM_RE.finditer(block):
-        rank, keyword = m.groups()
-        keyword = keyword.strip()
-        if len(keyword) < 2:
+    seen: set[tuple[str, str]] = set()  # (normalized keyword, source-tag)
+
+    for period_type, windows in _BLACKKIWI_PERIOD_WINDOWS:
+        try:
+            resp = session.get(
+                BLACKKIWI_ISSUE_KEYWORDS_API,
+                params={"periodType": period_type},
+                timeout=HTTP_TIMEOUT,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            _log(f"blackkiwi issue-keywords ({period_type}) failed: {exc}")
             continue
-        items.append(TrendItem(keyword=keyword, source="blackkiwi", rank=int(rank), windows=("24h",)))
+
+        if not isinstance(payload, list):
+            _log(f"blackkiwi issue-keywords ({period_type}): unexpected payload type {type(payload)}")
+            continue
+
+        source = f"blackkiwi_{period_type}"
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            keyword = str(entry.get("keyword") or "").strip()
+            if len(keyword) < 2:
+                continue
+            key = (re.sub(r"\s+", "", keyword), source)
+            if key in seen:
+                continue
+            seen.add(key)
+            rank_raw = entry.get("rank")
+            traffic_raw = entry.get("traffic")
+            try:
+                rank = int(rank_raw) if rank_raw is not None else None
+            except (TypeError, ValueError):
+                rank = None
+            try:
+                traffic = int(traffic_raw) if traffic_raw is not None else None
+            except (TypeError, ValueError):
+                traffic = None
+            items.append(
+                TrendItem(
+                    keyword=keyword,
+                    source=source,
+                    rank=rank,
+                    traffic=traffic,
+                    windows=windows,
+                )
+            )
+
+    try:
+        resp = session.get(BLACKKIWI_NEW_KEYWORDS_API, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        _log(f"blackkiwi new-keywords failed: {exc}")
+        payload = None
+
+    if isinstance(payload, dict):
+        # Response shape: {"2026-07-20 월": [{"keyword": "...", "searchVolume": N}, ...], ...}
+        # Walk dates newest-first and keep a modest number of fresh keywords.
+        dated_keys = sorted(payload.keys(), reverse=True)
+        rank = 0
+        for date_key in dated_keys[:3]:
+            entries = payload.get(date_key) or []
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                keyword = str(entry.get("keyword") or "").strip()
+                if len(keyword) < 2:
+                    continue
+                key = (re.sub(r"\s+", "", keyword), "blackkiwi_new")
+                if key in seen:
+                    continue
+                seen.add(key)
+                rank += 1
+                traffic_raw = entry.get("searchVolume")
+                try:
+                    traffic = int(traffic_raw) if traffic_raw is not None else None
+                except (TypeError, ValueError):
+                    traffic = None
+                items.append(
+                    TrendItem(
+                        keyword=keyword,
+                        source="blackkiwi_new",
+                        rank=rank,
+                        traffic=traffic,
+                        windows=("24h",),
+                    )
+                )
 
     _log(f"blackkiwi_trend: {len(items)} items")
     return items
