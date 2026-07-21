@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from html import escape
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from auth_blogger import load_credentials
 from fetch_trends import (
@@ -154,17 +156,29 @@ category={group.category_id} ({escape(group.category_name)}) · {escape(now)}</p
     return title, content, labels
 
 
+def _execute_with_retry(request, retries: int = 5):
+    delay = 8
+    for attempt in range(retries):
+        try:
+            return request.execute()
+        except HttpError as exc:
+            status = getattr(exc.resp, "status", None)
+            if status in {429, 500, 503} and attempt < retries - 1:
+                print(f"API {status}, retry in {delay}s...")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+
+
 def _upsert_post(service, blog_id: str, title: str, content: str, labels: list[str]):
-    recent = (
-        service.posts()
-        .list(blogId=blog_id, maxResults=50, fetchBodies=False)
-        .execute()
+    recent = _execute_with_retry(
+        service.posts().list(blogId=blog_id, maxResults=50, fetchBodies=False)
     )
     for existing in recent.get("items") or []:
         if existing.get("title") == title:
-            post = (
-                service.posts()
-                .update(
+            post = _execute_with_retry(
+                service.posts().update(
                     blogId=blog_id,
                     postId=existing["id"],
                     body={
@@ -176,13 +190,11 @@ def _upsert_post(service, blog_id: str, title: str, content: str, labels: list[s
                         "labels": labels,
                     },
                 )
-                .execute()
             )
             return post, "updated"
 
-    post = (
-        service.posts()
-        .insert(
+    post = _execute_with_retry(
+        service.posts().insert(
             blogId=blog_id,
             body={
                 "kind": "blogger#post",
@@ -193,7 +205,6 @@ def _upsert_post(service, blog_id: str, title: str, content: str, labels: list[s
             },
             isDraft=False,
         )
-        .execute()
     )
     return post, "published"
 
@@ -229,6 +240,7 @@ def main() -> None:
         url = post.get("url")
         results.append((action, group.category_name, title, url))
         print(f"{action.upper()}: {group.category_name} -> {url}")
+        time.sleep(2)
 
     print(f"Done. {len(results)} category posts.")
 
