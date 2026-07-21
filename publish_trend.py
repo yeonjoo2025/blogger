@@ -8,15 +8,29 @@ Pipeline:
   2. Drop entertainment / celebrity / sports / pure-name topics and keep
      only finance / investment / health / life-safety / legal topics that
      real news coverage confirms (keyword_filter.py).
-  3. Pick at most 3 of the strongest, non-duplicate topics. If nothing
-     clearly qualifies, publish nothing rather than force a weak post.
+  3. Pick at most MAX_POSTS_PER_RUN of the strongest, non-duplicate topics
+     (default 1). This is an editorial cap ("가장 이슈가 되는 것만, 애매하면
+     줄인다"), independent of Blogger's API quota below - running every 4
+     hours at 1/run keeps daily volume modest and sustainable on its own.
+     If nothing clearly qualifies, publish nothing rather than force a
+     weak post.
   4. Build a 5-section article (issue / affected / how to check / how to
      respond / related news) per topic (content_writer.py).
-  5. Publish via the Blogger API, respecting a tracked daily new-post quota
-     (Blogger throttles new-post creation on young/low-trust blogs, seen as
-     HTTP 403; default assumed quota is 6/day, override with
-     BLOGGER_MAX_NEW_POSTS_PER_DAY). Once the quota is used up for the day,
-     update the oldest existing post instead of attempting a new insert.
+  5. Publish via the Blogger API, respecting a tracked daily new-post quota.
+     Blogger has no officially documented per-day limit, but widely and
+     consistently reported real-world behavior across many accounts puts it
+     around 50 new posts/day per blog (independent of, and much lower than,
+     the Cloud Console's generic per-project request quota) - and young /
+     low-trust blogs are frequently throttled far below that (we observed
+     just 6/day on this brand-new blog). Because the real number varies and
+     isn't discoverable in advance, we only use MAX_NEW_POSTS_PER_DAY
+     (default 50, override with BLOGGER_MAX_NEW_POSTS_PER_DAY) as an upper
+     bound to skip an obviously-doomed insert call; the moment Blogger
+     actually returns 403/429, we treat that as *today's* real limit and
+     switch to updating the oldest existing post instead for the rest of
+     the run (and re-checked fresh next run, so a blog that matures past
+     its early throttling is picked up automatically without a code
+     change).
 
 Run: python3 publish_trend.py
 """
@@ -44,18 +58,25 @@ from keyword_filter import (
 )
 from trend_sources import KST, TrendItem, collect_all_trends, fetch_related_news
 
-MAX_POSTS_PER_RUN = 3
 DEDUPE_LOOKBACK_HOURS = 20
 NEWS_PER_CANDIDATE = 15
 NEWS_SHOWN_IN_POST = 6
 
-# Blogger throttles *new* post creation on young/low-trust blogs (observed as
-# HTTP 403 once a daily quota is hit) but still allows updating existing
-# posts. We track today's own new-post count from the blog itself so we stop
-# attempting inserts once the quota is used up instead of always failing
-# into the fallback path. Override with BLOGGER_MAX_NEW_POSTS_PER_DAY if
-# Blogger's actual quota for this account is known to differ.
-MAX_NEW_POSTS_PER_DAY = int(os.environ.get("BLOGGER_MAX_NEW_POSTS_PER_DAY", "6"))
+# Editorial cap: how many topics we're willing to write about per run. This
+# is a *content quality* decision ("가장 이슈가 되는 것만 작성, 애매하면
+# 줄인다"), deliberately independent of the API quota constant below. This
+# automation's cron runs every 4 hours (6x/day); at 1/run that's at most 6
+# new articles/day, a modest and sustainable pace regardless of what
+# Blogger's real per-day insert quota turns out to be.
+MAX_POSTS_PER_RUN = int(os.environ.get("BLOGGER_MAX_POSTS_PER_RUN", "1"))
+
+# Technical cap: an assumed upper bound on Blogger's undocumented daily
+# new-post quota, used only to skip an insert call we already expect to
+# fail. ~50/day per blog is the figure most consistently reported by
+# developers over the years; real behavior can be much stricter for young
+# blogs (see module docstring). Override with BLOGGER_MAX_NEW_POSTS_PER_DAY
+# if this account's real limit is known to differ.
+MAX_NEW_POSTS_PER_DAY = int(os.environ.get("BLOGGER_MAX_NEW_POSTS_PER_DAY", "50"))
 
 
 def log(msg: str) -> None:
