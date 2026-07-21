@@ -438,19 +438,21 @@ def fetch_loword_windows() -> dict[str, list[TrendItem]]:
 def is_entertainment(item: TrendItem) -> bool:
     if any(cid in EXCLUDED_CATEGORY_IDS for cid in item.category_ids):
         return True
-    title = item.title.lower()
-    if any(token.lower() in title for token in ENT_BLOCK):
+    title = item.title.strip()
+    title_l = title.lower()
+    if any(token.lower() in title_l for token in ENT_BLOCK):
         return True
-    # Likely pure celebrity/name noise if short proper-noun-like and no money hints.
-    if re.fullmatch(r"[A-Za-z가-힣]{2,4}", item.title) and not any(
-        h.lower() in title for h in MONEY_HINTS
+    if "," in title:  # often celebrity headline style on Loword Naver
+        return True
+    # Bare person-name shaped tokens without practical hints.
+    if re.fullmatch(r"[A-Za-z가-힣]{2,4}", title) and not any(
+        h.lower() in title_l for h in MONEY_HINTS
     ):
-        # Keep if clearly finance/health/law word; otherwise treat common celeb-length names as ent.
-        if item.source.startswith("loword-naver") and "," in item.title:
-            return True
-        if item.category_ids == (4,) or item.category_ids == (17,):
-            # sports alone can still be non-info; exclude bare names in sports/ent.
-            return True
+        return True
+    if any(cid == 17 for cid in item.category_ids) and not any(
+        h.lower() in title_l for h in MONEY_HINTS
+    ):
+        return True
     return False
 
 
@@ -535,10 +537,14 @@ def select_guide_keywords(
             # share a long common token
             tokens = set(re.findall(r"[가-힣A-Za-z0-9]{2,}", item.title))
             prev_tokens = set(re.findall(r"[가-힣A-Za-z0-9]{2,}", prev.title))
-            if len(tokens & prev_tokens) >= 2 and (
+            same_topic = (
+                ("화재" in item.title and "화재" in prev.title and ("쿠팡" in item.title and "쿠팡" in prev.title))
+                or ("이관개방" in item.title and "이관개방" in prev.title)
+                or ("회생" in item.title and "회생" in prev.title)
+                or ("근저당" in item.title and "근저당" in prev.title)
+            )
+            if same_topic or len(tokens & prev_tokens) >= 2 and (
                 "화재" in item.title and "화재" in prev.title
-                or "이관개방" in item.title and "이관개방" in prev.title
-                or "회생" in item.title and "회생" in prev.title
             ):
                 duplicate = True
                 break

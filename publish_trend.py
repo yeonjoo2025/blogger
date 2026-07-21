@@ -38,22 +38,30 @@ def _execute_with_retry(request, retries: int = 5):
 def _guide_title(keyword: str) -> str:
     """SEO-style practical title focused on method / detailed guide."""
     k = keyword.strip()
-    rules = [
-        (r"근저당", f"{k}이란? 뜻·설정 방법·말소 절차 상세 안내"),
-        (r"회생|파산|회생법원", f"{k} 신청 방법과 절차 총정리"),
-        (r"사이드카|코스피|주가|주식|주주", f"{k} 의미와 투자자가 확인할 점 상세 해설"),
-        (r"화재|물류|쿠팡", f"{k} 현황 정리와 피해·안전 대응 안내"),
-        (r"은행|대출|금리|보험|세금", f"{k} 이용·확인 방법 상세 가이드"),
-        (r"항공|항공권|비자", f"{k} 예약·이용 전 꼭 확인할 점 안내"),
-        (r"증상|질환|이관|치료|병원", f"{k} 증상·원인·대처 방법 상세 정리"),
-        (r"SQLD|자격|시험|취업", f"{k} 준비 방법과 일정·합격 포인트 안내"),
-        (r"국토교통|법원|신청|절차", f"{k} 업무 처리 방법 상세 안내"),
-    ]
-    for pattern, title in rules:
-        if re.search(pattern, k, re.I):
-            return title
+    if re.search(r"근저당", k):
+        return "근저당이란? 뜻·설정 방법·말소 절차 상세 안내"
+    if re.search(r"회생법원", k):
+        return f"{k} 개인회생 신청 전 확인사항·절차 상세 안내"
+    if re.search(r"회생|파산|항고", k):
+        return f"{k} 뜻과 대응 방법·절차 총정리"
+    if re.search(r"사이드카|코스피|주가|주식|주주", k):
+        return f"{k} 의미와 투자자가 확인할 점 상세 해설"
+    if re.search(r"쿠팡|물류.*화재|화재.*물류", k):
+        return "쿠팡 물류센터 화재 현황과 피해·안전 대응 방법 안내"
+    if re.search(r"이관개방", k):
+        return "이관개방증 증상·원인·대처 방법 상세 정리"
+    if re.search(r"독사", k):
+        return "독사 물렸을 때 증상 확인과 응급 대처 방법 상세 안내"
+    if re.search(r"은행|대출|금리|보험|세금", k):
+        return f"{k} 이용·확인 방법 상세 가이드"
+    if re.search(r"항공|항공권|비자", k):
+        return f"{k} 예약·이용 전 꼭 확인할 점 안내"
+    if re.search(r"SQLD|자격|시험|취업", k, re.I):
+        return f"{k} 준비 방법과 일정·합격 포인트 안내"
+    if re.search(r"국토교통|법원|신청|절차", k):
+        return f"{k} 업무 처리 방법 상세 안내"
     if len(k) <= 8:
-        return f"{k} 뜻부터 활용 방법까지 상세 안내"
+        return f"{k} 핵심 의미와 실무 확인 방법 상세 안내"
     return f"{k} 핵심 정리와 실무 확인 방법"
 
 
