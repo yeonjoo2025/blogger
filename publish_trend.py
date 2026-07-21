@@ -97,6 +97,8 @@ _TICKER_DISPLAY_NAMES = {
     "intc": "인텔(INTC)",
     "iren": "아이렌(IREN)",
     "spy": "S&P500 ETF(SPY)",
+    "005930": "삼성전자(005930)",
+    "000660": "SK하이닉스(000660)",
 }
 
 
