@@ -73,6 +73,7 @@ MONEY_HINTS = (
 ENT_BLOCK = (
     "콘서트", "드라마", "예능", "가수", "배우", "아이돌", "영화", "뮤비",
     "연애", "결혼지옥", "쇼츠", "틱톡", "릴스", "팬미팅", "월드컵응원",
+    "스페인", "아르헨티나", "축구중계", "하이라이트", "경기일정",
 )
 
 
@@ -540,7 +541,7 @@ def select_guide_keywords(
             same_topic = (
                 ("화재" in item.title and "화재" in prev.title and ("쿠팡" in item.title and "쿠팡" in prev.title))
                 or ("이관개방" in item.title and "이관개방" in prev.title)
-                or ("회생" in item.title and "회생" in prev.title)
+                or ("회생법원" in item.title and "회생법원" in prev.title)
                 or ("근저당" in item.title and "근저당" in prev.title)
             )
             if same_topic or len(tokens & prev_tokens) >= 2 and (
