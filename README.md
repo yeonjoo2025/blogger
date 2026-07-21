@@ -10,8 +10,10 @@ source .venv/bin/activate
 pip install google-auth-oauthlib google-auth-httplib2 google-api-python-client
 python get_token.py       # OAuth 토큰 1회 발급
 python publish_test.py    # 테스트 발행
-python publish_trend.py   # 트렌드 본글 발행
+python publish_trend.py   # 검색량순 트렌드 정보글 발행
 ```
+
+주제는 [Google Trends KR · 지난 4시간 · 검색량순](https://trends.google.com/trending?geo=KR&hours=4&sort=search-volume) 순위를 따릅니다.
 
 ## Cloud Agent / 자동화
 
