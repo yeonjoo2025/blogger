@@ -12,14 +12,18 @@ Pipeline:
      clearly qualifies, publish nothing rather than force a weak post.
   4. Build a 5-section article (issue / affected / how to check / how to
      respond / related news) per topic (content_writer.py).
-  5. Publish via the Blogger API. If a new post is rejected with 403/429,
-     update the oldest existing post instead.
+  5. Publish via the Blogger API, respecting a tracked daily new-post quota
+     (Blogger throttles new-post creation on young/low-trust blogs, seen as
+     HTTP 403; default assumed quota is 6/day, override with
+     BLOGGER_MAX_NEW_POSTS_PER_DAY). Once the quota is used up for the day,
+     update the oldest existing post instead of attempting a new insert.
 
 Run: python3 publish_trend.py
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -38,12 +42,20 @@ from keyword_filter import (
     is_qualified,
     normalize_keyword,
 )
-from trend_sources import TrendItem, collect_all_trends, fetch_related_news
+from trend_sources import KST, TrendItem, collect_all_trends, fetch_related_news
 
 MAX_POSTS_PER_RUN = 3
 DEDUPE_LOOKBACK_HOURS = 20
 NEWS_PER_CANDIDATE = 15
 NEWS_SHOWN_IN_POST = 6
+
+# Blogger throttles *new* post creation on young/low-trust blogs (observed as
+# HTTP 403 once a daily quota is hit) but still allows updating existing
+# posts. We track today's own new-post count from the blog itself so we stop
+# attempting inserts once the quota is used up instead of always failing
+# into the fallback path. Override with BLOGGER_MAX_NEW_POSTS_PER_DAY if
+# Blogger's actual quota for this account is known to differ.
+MAX_NEW_POSTS_PER_DAY = int(os.environ.get("BLOGGER_MAX_NEW_POSTS_PER_DAY", "6"))
 
 
 def log(msg: str) -> None:
@@ -231,6 +243,28 @@ def select_final_topics(
     return final
 
 
+def count_new_posts_today(recent_posts: list[dict], now: datetime) -> int:
+    """Count posts whose original publish date falls on today's KST date.
+
+    Falling back to updating an old post never changes its ``published``
+    timestamp, so this only counts genuinely *new* posts created today -
+    exactly what Blogger's daily new-post quota cares about.
+    """
+    today_kst = now.astimezone(KST).date()
+    count = 0
+    for post in recent_posts:
+        published = post.get("published")
+        if not published:
+            continue
+        try:
+            pub_dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if pub_dt.astimezone(KST).date() == today_kst:
+            count += 1
+    return count
+
+
 def publish_new_post(service, blog_id: str, title: str, content: str) -> dict:
     body = {"kind": "blogger#post", "blog": {"id": blog_id}, "title": title, "content": content}
     return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
@@ -269,33 +303,53 @@ def main() -> None:
     oldest_posts = sorted(recent_posts, key=lambda p: p.get("published") or "")
     fallback_used = False
 
+    new_posts_today = count_new_posts_today(recent_posts, now)
+    remaining_quota = max(0, MAX_NEW_POSTS_PER_DAY - new_posts_today)
+    log(
+        f"new posts published today (KST): {new_posts_today}/{MAX_NEW_POSTS_PER_DAY} "
+        f"-> {remaining_quota} new-post slot(s) left for this run"
+    )
+
+    def update_oldest_instead(title: str, content: str) -> None:
+        nonlocal fallback_used
+        fallback_used = True
+        target = None
+        for candidate_post in oldest_posts:
+            if candidate_post.get("id"):
+                target = candidate_post
+                break
+        if target is None:
+            log("  no existing post available to update; skipping this topic")
+            return
+        oldest_posts.remove(target)
+        try:
+            updated = update_old_post(service, blog_id, target["id"], title, content)
+            log(f"  updated old post instead: {updated.get('url')}")
+        except HttpError as exc2:
+            log(f"  update fallback also failed (HTTP {getattr(exc2.resp, 'status', '?')})")
+
     for idx, topic in enumerate(final_topics, start=1):
         title = build_title(topic.keyword, topic.category)
         content = build_body_html(topic.keyword, topic.category, topic.news)
-        log(f"[{idx}/{len(final_topics)}] publishing '{title}' (category={topic.category})")
+        log(f"[{idx}/{len(final_topics)}] '{title}' (category={topic.category})")
+
+        if remaining_quota <= 0:
+            log("  daily new-post quota already used up; updating an old post instead of trying to insert")
+            update_oldest_instead(title, content)
+            if idx < len(final_topics):
+                time.sleep(2)
+            continue
 
         try:
             post = publish_new_post(service, blog_id, title, content)
             log(f"  published: {post.get('url')}")
+            remaining_quota -= 1
         except HttpError as exc:
             status = getattr(exc.resp, "status", None)
             if status in (403, 429):
-                log(f"  new post blocked (HTTP {status}); falling back to updating an old post")
-                fallback_used = True
-                target = None
-                for candidate_post in oldest_posts:
-                    if candidate_post.get("id"):
-                        target = candidate_post
-                        break
-                if target is None:
-                    log("  no existing post available to update; skipping this topic")
-                    continue
-                oldest_posts.remove(target)
-                try:
-                    updated = update_old_post(service, blog_id, target["id"], title, content)
-                    log(f"  updated old post instead: {updated.get('url')}")
-                except HttpError as exc2:
-                    log(f"  update fallback also failed (HTTP {getattr(exc2.resp, 'status', '?')})")
+                log(f"  new post blocked (HTTP {status}); daily quota reached earlier than expected")
+                remaining_quota = 0
+                update_oldest_instead(title, content)
             else:
                 log(f"  publish failed (HTTP {status}), skipping this topic")
 
