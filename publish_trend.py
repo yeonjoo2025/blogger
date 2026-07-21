@@ -267,7 +267,15 @@ def build_post(item: TrendItem, now: str) -> tuple[str, str, list[str]]:
     return title, content, labels
 
 
-def _upsert_post(service, blog_id: str, title: str, content: str, labels: list[str]):
+def _upsert_post(
+    service,
+    blog_id: str,
+    title: str,
+    content: str,
+    labels: list[str],
+    *,
+    recycle_ids: list[str] | None = None,
+):
     recent = _execute_with_retry(
         service.posts().list(blogId=blog_id, maxResults=50, fetchBodies=False)
     )
@@ -289,20 +297,41 @@ def _upsert_post(service, blog_id: str, title: str, content: str, labels: list[s
             )
             return post, "updated"
 
-    post = _execute_with_retry(
-        service.posts().insert(
-            blogId=blog_id,
-            body={
-                "kind": "blogger#post",
-                "blog": {"id": blog_id},
-                "title": title,
-                "content": content,
-                "labels": labels,
-            },
-            isDraft=False,
+    try:
+        post = _execute_with_retry(
+            service.posts().insert(
+                blogId=blog_id,
+                body={
+                    "kind": "blogger#post",
+                    "blog": {"id": blog_id},
+                    "title": title,
+                    "content": content,
+                    "labels": labels,
+                },
+                isDraft=False,
+            )
         )
-    )
-    return post, "published"
+        return post, "published"
+    except HttpError as exc:
+        status = getattr(exc.resp, "status", None)
+        if status not in {403, 429} or not recycle_ids:
+            raise
+        post_id = recycle_ids.pop(0)
+        post = _execute_with_retry(
+            service.posts().update(
+                blogId=blog_id,
+                postId=post_id,
+                body={
+                    "kind": "blogger#post",
+                    "id": post_id,
+                    "blog": {"id": blog_id},
+                    "title": title,
+                    "content": content,
+                    "labels": labels,
+                },
+            )
+        )
+        return post, "recycled"
 
 
 def main() -> None:
@@ -322,10 +351,30 @@ def main() -> None:
     print(f"Using blog: {blog.get('name')} ({blog_id})")
 
     now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+    recent = _execute_with_retry(
+        service.posts().list(blogId=blog_id, maxResults=50, fetchBodies=False)
+    )
+    keep_fragments = [item.title[:8] for item in keywords] + ["상세 안내", "총정리", "상세 정리", "상세 해설", "상세 가이드"]
+    recycle_ids = []
+    for post in recent.get("items") or []:
+        title = post.get("title") or ""
+        if any(frag and frag in title for frag in keep_fragments):
+            continue
+        if title.startswith("[검색량 TOP5]") or "이슈 TOP" in title or "여행 트렌드" in title:
+            recycle_ids.append(post["id"])
+    print(f"Recycle candidates: {len(recycle_ids)}")
+
     results = []
     for item in keywords:
         title, content, labels = build_post(item, now)
-        post, action = _upsert_post(service, blog_id, title, content, labels)
+        post, action = _upsert_post(
+            service,
+            blog_id,
+            title,
+            content,
+            labels,
+            recycle_ids=recycle_ids,
+        )
         url = post.get("url")
         results.append((action, title, url))
         print(f"{action.upper()}: {title} -> {url}")
