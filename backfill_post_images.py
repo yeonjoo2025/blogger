@@ -1,7 +1,9 @@
-"""One-shot: add a generated hero image to every LIVE post that has none.
+"""One-shot / re-run: attach (or replace) 16:9 news thumbnails on LIVE posts.
 
-Uses the same generate → Blogger resumable upload → posts.patch() path as
-the publish_trend automation, so the result matches what future runs produce.
+Usage:
+  python3 backfill_post_images.py              # only posts with no <img>
+  python3 backfill_post_images.py --replace    # regenerate on posts that
+                                               # already have post-thumb/post-hero
 """
 
 from __future__ import annotations
@@ -15,10 +17,13 @@ from googleapiclient.errors import HttpError
 
 from blogger_auth import load_credentials
 from keyword_filter import classify
-from post_images import build_and_host_hero, content_has_image, inject_hero_image
+from post_images import (
+    build_thumb_for_post,
+    content_has_image,
+    inject_thumb_html,
+)
 from trend_sources import NewsRef
 
-# Re-run mode: replace existing heroes (used when regenerating thumbnail style).
 REPLACE_EXISTING = "--replace" in sys.argv
 
 
@@ -26,34 +31,32 @@ def _guess_category(title: str) -> str:
     category, include_hits, _exclude = classify(title, [NewsRef(title=title)])
     if category and include_hits > 0:
         return category
-    # Lightweight fallbacks for titles our filter lexicon doesn't cover.
-    lowered = title.lower()
-    if any(k in title for k in ("주가", "증시", "코스닥", "코스피", "투자", "ETF", "근저당")):
+    if any(k in title for k in ("주가", "증시", "코스닥", "코스피", "투자", "ETF", "근저당", "키미")):
         return "투자"
-    if any(k in title for k in ("관세", "대출", "세금", "금융", "미소금융")):
+    if any(k in title for k in ("관세", "대출", "세금", "금융", "미소금융", "사이드카")):
         return "금융"
     if any(k in title for k in ("댐", "호우", "태풍", "화재", "대피")):
         return "생활안전"
     if any(k in title for k in ("판결", "구속", "소송", "법")):
         return "법률"
-    if any(k in lowered for k in ("messi", "kt", "두산", "월드컵", "야구", "축구")):
-        return "생활안전"
     return "금융"
 
 
 def _keyword_from_title(title: str) -> str:
-    # Prefer the phrase before the first topical separator used by our
-    # pipeline titles. Use ", " (comma+space) rather than bare "," so that
-    # amounts like "(2,000억원)" are not truncated mid-parenthesis.
     head = title
     for sep in (", ", " - ", "…", "...", "？", "?"):
         if sep in head:
             head = head.split(sep, 1)[0].strip()
             break
-    # Drop trailing parenthetical angle crumbs like "(3개월)" / "(2,000억원)"
-    # so the card-news title stays punchy.
     head = re.sub(r"\s*[\(（][^\)）]{0,24}[\)）]\s*$", "", head).strip()
     return head[:40] or title.strip()[:40]
+
+
+def _needs_replace(content: str) -> bool:
+    return bool(
+        re.search(r'class="post-thumb"', content or "", flags=re.I)
+        or re.search(r'class="post-hero"', content or "", flags=re.I)
+    )
 
 
 def main() -> None:
@@ -69,29 +72,37 @@ def main() -> None:
         for post in response.get("items") or []:
             content = post.get("content") or ""
             if REPLACE_EXISTING:
-                # Only touch posts that already carry our generated hero, so we
-                # don't overwrite manually curated images on older posts.
-                if 'class="post-hero"' in content or "post-hero" in content:
+                if _needs_replace(content):
                     targets.append(post)
             elif not content_has_image(content):
                 targets.append(post)
         request = service.posts().list_next(request, response)
 
-    mode = "replace card-news thumbnails on" if REPLACE_EXISTING else "add images to"
+    mode = "replace news thumbnails on" if REPLACE_EXISTING else "add news thumbnails to"
     print(f"[backfill_post_images] {mode} {len(targets)} LIVE post(s)", flush=True)
+
     updated = 0
     for idx, post in enumerate(targets, start=1):
         post_id = post["id"]
         title = post.get("title") or ""
         keyword = _keyword_from_title(title)
         category = _guess_category(title)
-        print(f"[{idx}/{len(targets)}] {title!r} -> keyword={keyword!r} category={category}", flush=True)
+        print(
+            f"[{idx}/{len(targets)}] {title!r} -> keyword={keyword!r} category={category}",
+            flush=True,
+        )
         try:
-            url = build_and_host_hero(creds, keyword, category)
-            new_content = inject_hero_image(
+            url, main, sub = build_thumb_for_post(
+                title=title,
+                keyword=keyword,
+                category=category,
+                push=True,
+            )
+            print(f"  texts: main={main!r} sub={sub!r}", flush=True)
+            new_content = inject_thumb_html(
                 post.get("content") or "",
                 url,
-                alt=keyword,
+                main,
                 replace_existing=REPLACE_EXISTING,
             )
             service.posts().patch(
@@ -100,6 +111,7 @@ def main() -> None:
                 body={"content": new_content},
             ).execute()
             print(f"  updated: {post.get('url')}", flush=True)
+            print(f"  thumb: {url}", flush=True)
             updated += 1
         except HttpError as exc:
             print(f"  patch failed HTTP {getattr(exc.resp, 'status', None)}: {exc}", flush=True)

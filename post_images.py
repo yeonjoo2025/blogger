@@ -1,62 +1,78 @@
-"""Generate a card-news thumbnail image and host it on Blogger photo storage.
+"""Korean news-style (16:9) thumbnail generation for Blogger posts.
 
-Blogger's account-wide write restriction blocks posts.insert(), but
-posts.patch() still works, and the resumable photo-upload endpoint used by
-the Blogger web editor also accepts our existing OAuth token. That lets us:
+Pipeline (runs right before a post is published / patched):
+  1. Derive short main (~8 chars) + sub (~14 chars) Korean lines from the
+     post title / keyword.
+  2. Build a 16:9 cinematic news/sports-broadcast thumbnail (Pillow), with
+     a dark translucent lower-third banner, large white headline, smaller
+     yellow/cyan subheadline, and a required "@욘두두" watermark.
+  3. Save as JPG (1280px wide) under posts/images/thumb-{slug}.jpg.
+  4. git add/commit/push that file and build a jsDelivr CDN URL pinned to
+     the resulting commit SHA.
+  5. Prepend the required <p><img class="post-thumb" ...></p> block.
 
-  1. Paint a square (1080x1080) card-news style thumbnail locally with
-     Pillow - bold centered keyword, category badge, short CTA - no
-     external image API key required (works unattended in cron).
-  2. Upload it to blogger.googleusercontent.com via the resumable upload
-     protocol the web editor itself uses.
-  3. Inject the <img> at the top of the post HTML.
+The design brief (used both as the Pillow composition guide and as the
+prompt seed if an external image model is later wired in) is:
 
-Used both by publish_trend.py (new posts) and by the one-shot backfill of
-existing LIVE posts that currently have no image.
+  Korean news thumbnail, 16:9, cinematic {atmosphere}, high contrast,
+  dark translucent banner on lower third.
+  Large bold white Korean headline clearly readable: "{main}".
+  Smaller bold yellow Korean subheadline below it: "{sub}".
+  No logos, no watermarks (except the required @욘두두 credit),
+  no realistic celebrity face, no long paragraphs.
 """
 
 from __future__ import annotations
 
-import json
+import os
 import random
 import re
+import subprocess
 import time
 from html import escape
 from pathlib import Path
 
-import requests
 from PIL import Image, ImageDraw, ImageFont
-from google.oauth2.credentials import Credentials
 
-IMAGE_CACHE_DIR = Path("generated_images")
-UPLOAD_START_URL = "https://docs.google.com/upload/blogger/photos/resumable"
+IMAGE_DIR = Path("posts/images")
+REPO_SLUG = os.environ.get("BLOGGER_GITHUB_REPO", "yeonjoo2025/blogger")
+JSDELIVR_TMPL = "https://cdn.jsdelivr.net/gh/{repo}@{sha}/posts/images/{filename}"
 
-# Soft, category-specific palettes. Avoid the generic purple/cream AI look.
-CATEGORY_PALETTES: dict[str, tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]] = {
-    "금융": ((18, 52, 68), (46, 120, 110), (212, 180, 110)),       # deep teal → gold
-    "투자": ((22, 32, 58), (50, 90, 150), (230, 140, 70)),         # navy → amber
-    "건강": ((30, 60, 50), (70, 140, 110), (200, 210, 160)),       # forest → sage
-    "생활안전": ((60, 40, 30), (160, 90, 50), (230, 190, 120)),    # umber → sand
-    "법률": ((28, 34, 48), (80, 90, 120), (190, 170, 140)),        # slate → warm grey
+# Category → (top, mid, accent, atmosphere phrase for the prompt)
+CATEGORY_LOOK: dict[str, tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int], str]] = {
+    "금융": ((12, 28, 48), (30, 90, 110), (255, 214, 60), "finance desk city night bokeh charts glow"),
+    "투자": ((10, 18, 40), (40, 70, 140), (255, 214, 60), "stock market candlestick neon trading floor mood"),
+    "건강": ((14, 40, 36), (40, 110, 90), (120, 230, 220), "clean medical light abstract soft green cyan"),
+    "생활안전": ((40, 24, 18), (120, 70, 40), (255, 214, 60), "stormy sky emergency glow dramatic weather"),
+    "법률": ((20, 24, 36), (55, 70, 100), (120, 230, 220), "courthouse pillars abstract solemn blue grey"),
 }
-_DEFAULT_PALETTE = ((30, 40, 55), (70, 100, 130), (180, 190, 200))
+_DEFAULT_LOOK = ((16, 22, 36), (50, 70, 110), (255, 214, 60), "cinematic newsroom abstract high contrast")
 
-_TOKEN_CLEAN_RE = re.compile(r"[\[\]()（）]")
+_PROMPT_TMPL = (
+    'Korean news thumbnail, 16:9, cinematic {atmosphere}, high contrast, '
+    'dark translucent banner on lower third. '
+    'Large bold white Korean headline clearly readable: "{main}". '
+    'Smaller bold yellow Korean subheadline below it: "{sub}". '
+    'No logos, no watermarks, no realistic celebrity face, no long paragraphs.'
+)
 
 
 def _log(msg: str) -> None:
     print(f"[post_images] {msg}", flush=True)
 
 
+def build_image_prompt(main: str, sub: str, category: str) -> str:
+    _top, _mid, _accent, atmosphere = CATEGORY_LOOK.get(category, _DEFAULT_LOOK)
+    return _PROMPT_TMPL.format(atmosphere=atmosphere, main=main, sub=sub)
+
+
 def _pick_font(size: int) -> ImageFont.ImageFont:
-    """Prefer a CJK-capable system font; fall back to default bitmap font."""
     candidates = [
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansKR-Bold.otf",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     ]
     for path in candidates:
         if Path(path).exists():
@@ -67,349 +83,338 @@ def _pick_font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def _wrap_text(
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    font: ImageFont.ImageFont,
-    max_width: int,
-    max_lines: int = 3,
-) -> list[str]:
-    # Character-wise wrap works better for mixed Korean/English titles.
-    lines: list[str] = []
-    current = ""
-    for ch in text:
-        trial = current + ch
-        if draw.textlength(trial, font=font) <= max_width:
-            current = trial
-        else:
-            if current:
-                lines.append(current)
-            current = ch
-    if current:
-        lines.append(current)
-    return lines[:max_lines]
+def _clamp_chars(text: str, target: int, hard_max: int | None = None) -> str:
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    hard_max = hard_max or target + 4
+    if len(text) <= hard_max:
+        return text
+    return text[:target].rstrip()
 
 
-def _fit_title_font(draw: ImageDraw.ImageDraw, text: str, max_width: int, max_size: int = 110, min_size: int = 52) -> tuple[ImageFont.ImageFont, list[str]]:
-    """Pick the largest font size that fits the keyword in <= 3 centered lines."""
-    for size in range(max_size, min_size - 1, -4):
-        font = _pick_font(size)
-        lines = _wrap_text(draw, text, font, max_width=max_width, max_lines=3)
-        if len("".join(lines)) < len(text):
-            continue  # truncated
-        widest = max((draw.textlength(line, font=font) for line in lines), default=0)
-        if widest <= max_width and len(lines) <= 3:
-            return font, lines
-    font = _pick_font(min_size)
-    return font, _wrap_text(draw, text, font, max_width=max_width, max_lines=3)
+def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple[str, str]:
+    """Return (main ~8 chars, sub ~14 chars) for the lower-third banner."""
+    title = (title or "").strip()
+    keyword = (keyword or "").strip()
+
+    # Prefer the head of our pipeline titles ("키워드, 무슨 일이길래? ...").
+    head = title
+    for sep in (", ", " - ", "…", "...", "？", "?"):
+        if sep in head:
+            head = head.split(sep, 1)[0].strip()
+            break
+    head = re.sub(r"\s*[\(（][^\)）]{0,24}[\)）]\s*$", "", head).strip()
+    main_src = keyword or head or title
+    main_src = re.sub(r"\s*[\(（][^\)）]{0,24}[\)）]\s*$", "", main_src).strip()
+    # If the keyword alone is too short (e.g. "메시"), pull a few more
+    # meaningful Hangul tokens from the title to reach ~8 chars.
+    if len(re.findall(r"[가-힣A-Za-z0-9]", main_src)) < 5:
+        extras = re.findall(r"[가-힣A-Za-z0-9]{2,}", title)
+        built = main_src
+        for tok in extras:
+            if tok in built:
+                continue
+            trial = f"{built} {tok}".strip()
+            if len(trial) > 12:
+                break
+            built = trial
+            if len(re.findall(r"[가-힣A-Za-z0-9]", built)) >= 8:
+                break
+        main_src = built
+    main = _clamp_chars(main_src, target=8, hard_max=12)
+
+    # Sub: meaningful remainder of the title after the keyword, else a
+    # category cue. Strip pipeline boilerplate and dangling parentheses.
+    remainder = title
+    for token in (main_src, keyword, head):
+        if token and token in remainder:
+            remainder = remainder.replace(token, "", 1)
+            break
+    remainder = re.sub(r"[\(（][^\)）]{0,24}[\)）]", " ", remainder)
+    remainder = re.sub(
+        r"(무슨 일이길래\??|정리|확인·대응법|대응 전략|대응법|지갑에 영향|투자자 영향과)",
+        " ",
+        remainder,
+    )
+    remainder = re.sub(r"^[\s,，\-–—:：]+", "", remainder)
+    remainder = re.sub(r"\s+", " ", remainder).strip(" ,-·")
+    fallback = {
+        "금융": "지갑 영향과 대응 포인트",
+        "투자": "투자자 영향과 대응 전략",
+        "건강": "건강 영향과 대응 수칙",
+        "생활안전": "안전 영향과 대피 요령",
+        "법률": "법적 영향과 대응 절차",
+    }.get(category, "핵심 이슈와 대응 정리")
+    # Prefer remainder only when it still looks like a real Korean phrase.
+    hangul_len = len(re.findall(r"[가-힣]", remainder))
+    if hangul_len >= 5 and len(remainder) >= 6:
+        sub = _clamp_chars(remainder, target=14, hard_max=18)
+    else:
+        sub = _clamp_chars(fallback, target=14, hard_max=18)
+    return main, sub
 
 
-def _center_text(
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    font: ImageFont.ImageFont,
-    cx: int,
-    y: int,
-    fill: tuple[int, int, int],
-    shadow: tuple[int, int, int] | None = (0, 0, 0),
-) -> int:
-    width = draw.textlength(text, font=font)
-    x = int(cx - width / 2)
-    if shadow:
-        draw.text((x + 3, y + 3), text, font=font, fill=shadow)
-    draw.text((x, y), text, font=font, fill=fill)
-    ascent, descent = font.getmetrics()
-    return y + ascent + descent + 8
+def slugify(keyword: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z가-힣]+", "-", (keyword or "").strip()).strip("-")
+    return (slug[:48] or "topic").lower()
 
 
-def generate_header_image(keyword: str, category: str, out_path: Path, seed: str | None = None) -> Path:
-    """Paint a 1080x1080 card-news thumbnail for the given topic.
-
-    Layout (one composition, SNS/card-news style):
-      - square canvas
-      - category badge near the top
-      - huge centered keyword
-      - one short supporting line
-      - bottom CTA strip ("지금 확인하기")
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    rng = random.Random(seed or f"{category}:{keyword}")
-
-    top, mid, accent = CATEGORY_PALETTES.get(category, _DEFAULT_PALETTE)
-    size = 1080
-    img = Image.new("RGB", (size, size), top)
+def _draw_cinematic_background(
+    width: int,
+    height: int,
+    top: tuple[int, int, int],
+    mid: tuple[int, int, int],
+    accent: tuple[int, int, int],
+    seed: str,
+) -> Image.Image:
+    """Abstract cinematic news backdrop - no faces, no logos, no body text."""
+    rng = random.Random(seed)
+    img = Image.new("RGB", (width, height), top)
     draw = ImageDraw.Draw(img)
 
-    # Diagonal gradient background (atmosphere, not flat).
-    for y in range(size):
-        t = y / (size - 1)
-        # Slight horizontal bias so it doesn't look like a boring vertical wipe.
-        r = int(top[0] * (1 - t) + mid[0] * t)
-        g = int(top[1] * (1 - t) + mid[1] * t)
-        b = int(top[2] * (1 - t) + mid[2] * t)
-        draw.line([(0, y), (size, y)], fill=(r, g, b))
+    for y in range(height):
+        t = y / (height - 1)
+        # Bias mid color into the upper/center "subject atmosphere" zone.
+        ease = t ** 0.85
+        r = int(top[0] * (1 - ease) + mid[0] * ease)
+        g = int(top[1] * (1 - ease) + mid[1] * ease)
+        b = int(top[2] * (1 - ease) + mid[2] * ease)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
 
-    overlay = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     odraw = ImageDraw.Draw(overlay)
-    # Soft radial glow behind the title area.
-    for i, alpha in ((420, 50), (300, 70), (180, 40)):
+
+    # Soft light blooms (broadcast LED wall feel).
+    for _ in range(4):
+        cx = rng.randint(width // 5, width * 4 // 5)
+        cy = rng.randint(height // 10, height // 2)
+        rad = rng.randint(140, 280)
         odraw.ellipse(
-            [size // 2 - i, size // 2 - i - 40, size // 2 + i, size // 2 + i - 40],
-            fill=(*mid, alpha),
+            [cx - rad, cy - rad, cx + rad, cy + rad],
+            fill=(*accent, rng.randint(18, 40)),
         )
-    # Corner accent shapes for card-news energy.
-    odraw.polygon([(0, 0), (280, 0), (0, 220)], fill=(*accent, 55))
-    odraw.polygon([(size, size), (size - 320, size), (size, size - 240)], fill=(*accent, 70))
-    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-    draw = ImageDraw.Draw(img)
 
-    # Outer frame (card edge).
-    inset = 36
-    draw.rounded_rectangle(
-        [inset, inset, size - inset, size - inset],
-        radius=28,
-        outline=accent,
-        width=6,
-    )
+    # Diagonal speed lines / lens streaks.
+    for i in range(6):
+        x0 = rng.randint(-100, width // 2)
+        odraw.polygon(
+            [
+                (x0, 0),
+                (x0 + rng.randint(40, 90), 0),
+                (x0 - rng.randint(80, 180), height * 2 // 3),
+                (x0 - rng.randint(160, 260), height * 2 // 3),
+            ],
+            fill=(*mid, 28),
+        )
 
-    # Category badge (pill-like, but not a content card - just a label).
-    badge_font = _pick_font(34)
-    badge_text = f"{category} 이슈"
-    badge_pad_x, badge_pad_y = 28, 14
-    badge_w = int(draw.textlength(badge_text, font=badge_font)) + badge_pad_x * 2
-    badge_h = 34 + badge_pad_y * 2
-    badge_x = (size - badge_w) // 2
-    badge_y = 120
-    draw.rounded_rectangle(
-        [badge_x, badge_y, badge_x + badge_w, badge_y + badge_h],
-        radius=badge_h // 2,
-        fill=accent,
-    )
-    draw.text(
-        (badge_x + badge_pad_x, badge_y + badge_pad_y - 2),
-        badge_text,
-        font=badge_font,
-        fill=(20, 20, 20),
-    )
+    # Abstract geometric blocks suggesting news graphics (not a UI card).
+    for _ in range(3):
+        x1 = rng.randint(width // 2, width - 40)
+        y1 = rng.randint(40, height // 3)
+        x2 = x1 + rng.randint(60, 180)
+        y2 = y1 + rng.randint(40, 120)
+        odraw.rectangle([x1, y1, x2, y2], outline=(*accent, 70), width=3)
 
-    # Main keyword - large, centered.
-    clean_kw = _TOKEN_CLEAN_RE.sub("", keyword).strip() or keyword
-    title_font, lines = _fit_title_font(draw, clean_kw, max_width=size - 160)
-    line_height = title_font.getmetrics()[0] + title_font.getmetrics()[1] + 10
-    block_h = line_height * len(lines)
-    y = size // 2 - block_h // 2 - 20
-    for line in lines:
-        y = _center_text(draw, line, title_font, size // 2, y, fill=(250, 248, 240))
+    return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
 
-    # Supporting one-liner under the keyword.
-    sub_font = _pick_font(36)
-    y += 18
-    _center_text(
-        draw,
-        "무슨 일이길래? 영향·대응 정리",
-        sub_font,
-        size // 2,
-        y,
-        fill=(230, 225, 210),
-        shadow=None,
-    )
 
-    # Bottom CTA strip (card-news staple).
-    strip_h = 110
-    draw.rectangle([inset + 8, size - inset - strip_h, size - inset - 8, size - inset - 8], fill=accent)
-    cta_font = _pick_font(40)
-    cta = "지금 바로 확인하기 →"
-    cta_w = draw.textlength(cta, font=cta_font)
-    draw.text(
-        ((size - cta_w) / 2, size - inset - strip_h + 30),
-        cta,
-        font=cta_font,
-        fill=(20, 20, 20),
-    )
+def _draw_watermark(img: Image.Image) -> None:
+    """Required credit mark: translucent chip + white '@욘두두' at lower-right."""
+    draw = ImageDraw.Draw(img, "RGBA")
+    font = _pick_font(28)
+    text = "@욘두두"
+    pad_x, pad_y = 12, 6
+    tw = int(draw.textlength(text, font=font))
+    th = font.getmetrics()[0] + font.getmetrics()[1]
+    w, h = img.size
+    box = [
+        w - tw - pad_x * 2 - 28,
+        h - th - pad_y * 2 - 22,
+        w - 20,
+        h - 16,
+    ]
+    draw.rounded_rectangle(box, radius=8, fill=(0, 0, 0, 140))
+    draw.text((box[0] + pad_x, box[1] + pad_y - 1), text, font=font, fill=(255, 255, 255, 230))
 
-    # Tiny decorative dots (kept sparse so they don't fight the title).
-    for _ in range(10):
-        x = rng.randint(80, size - 80)
-        yy = rng.randint(220, size - 220)
-        # Keep dots away from the center title band.
-        if abs(yy - size // 2) < 140:
-            continue
-        r = rng.randint(3, 6)
-        draw.ellipse([x - r, yy - r, x + r, yy + r], fill=accent)
 
-    img.save(out_path, format="PNG", optimize=True)
+def generate_news_thumbnail(
+    main: str,
+    sub: str,
+    category: str,
+    out_path: Path,
+    seed: str | None = None,
+) -> Path:
+    """Render a 16:9 Korean news thumbnail JPG (1280x720) to out_path."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    top, mid, accent, _atmosphere = CATEGORY_LOOK.get(category, _DEFAULT_LOOK)
+    width, height = 1280, 720
+    seed = seed or f"{category}:{main}:{sub}"
+
+    img = _draw_cinematic_background(width, height, top, mid, accent, seed)
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    # Dark translucent lower-third banner.
+    banner_top = int(height * 0.62)
+    draw.rectangle([0, banner_top, width, height], fill=(0, 0, 0, 175))
+    # Thin accent rule above the banner (broadcast lower-third cue).
+    draw.rectangle([0, banner_top, width, banner_top + 5], fill=(*accent, 220))
+
+    # Main headline (large bold white).
+    main_size = 78
+    main_font = _pick_font(main_size)
+    while draw.textlength(main, font=main_font) > width - 80 and main_size > 44:
+        main_size -= 4
+        main_font = _pick_font(main_size)
+    main_x = 40
+    main_y = banner_top + 28
+    draw.text((main_x + 3, main_y + 3), main, font=main_font, fill=(0, 0, 0, 180))
+    draw.text((main_x, main_y), main, font=main_font, fill=(255, 255, 255, 255))
+
+    # Subheadline (smaller bold yellow or cyan).
+    sub_color = accent  # yellow or cyan depending on category palette
+    sub_size = 40
+    sub_font = _pick_font(sub_size)
+    while draw.textlength(sub, font=sub_font) > width - 80 and sub_size > 28:
+        sub_size -= 2
+        sub_font = _pick_font(sub_size)
+    sub_y = main_y + main_font.getmetrics()[0] + main_font.getmetrics()[1] + 10
+    draw.text((main_x + 2, sub_y + 2), sub, font=sub_font, fill=(0, 0, 0, 160))
+    draw.text((main_x, sub_y), sub, font=sub_font, fill=(*sub_color, 255))
+
+    # Required watermark - never publish without this.
+    _draw_watermark(img)
+
+    # Flatten alpha and save JPG.
+    rgb = img.convert("RGB")
+    rgb.save(out_path, format="JPEG", quality=88, optimize=True)
     return out_path
 
 
-def upload_image_to_blogger(creds: Credentials, image_path: Path) -> str:
-    """Upload a local image via Blogger's resumable photo upload endpoint.
-
-    Returns a direct blogger.googleusercontent.com URL suitable for <img src>.
-    """
-    if not creds.valid:
-        from google.auth.transport.requests import Request
-
-        creds.refresh(Request())
-
-    raw = image_path.read_bytes()
-    filename = image_path.name
-    content_type = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
-
-    session = requests.Session()
-    last_error: Exception | None = None
-    for attempt in range(5):
-        try:
-            if not creds.token:
-                from google.auth.transport.requests import Request
-
-                creds.refresh(Request())
-
-            start_headers = {
-                "authorization": f"Bearer {creds.token}",
-                "content-type": "application/json; charset=UTF-8",
-                "x-goog-upload-command": "start",
-                "x-goog-upload-header-content-length": str(len(raw)),
-                "x-goog-upload-header-content-type": content_type,
-                "x-goog-upload-protocol": "resumable",
-            }
-            payload = {
-                "protocolVersion": "0.8",
-                "createSessionRequest": {
-                    "fields": [
-                        {
-                            "external": {
-                                "name": "file",
-                                "filename": filename,
-                                "put": {},
-                                "size": len(raw),
-                            }
-                        },
-                        {
-                            "inlined": {
-                                "name": "title",
-                                "content": filename,
-                                "contentType": "text/plain",
-                            }
-                        },
-                        {
-                            "inlined": {
-                                "name": "addtime",
-                                "content": str(int(time.time() * 1000)),
-                                "contentType": "text/plain",
-                            }
-                        },
-                        {
-                            "inlined": {
-                                "name": "onepick_version",
-                                "content": "v2",
-                                "contentType": "text/plain",
-                            }
-                        },
-                        {
-                            "inlined": {
-                                "name": "album_mode",
-                                "content": "permanent",
-                                "contentType": "text/plain",
-                            }
-                        },
-                        {
-                            "inlined": {
-                                "name": "silo_id",
-                                "content": "3",
-                                "contentType": "text/plain",
-                            }
-                        },
-                    ]
-                },
-            }
-            start_resp = session.post(
-                UPLOAD_START_URL,
-                headers=start_headers,
-                data=json.dumps(payload),
-                params={"authuser": "0"},
-                timeout=30,
-            )
-            if not start_resp.ok or "x-goog-upload-url" not in start_resp.headers:
-                raise RuntimeError(
-                    f"upload session start failed: HTTP {start_resp.status_code} {start_resp.text[:300]}"
-                )
-            upload_url = start_resp.headers["x-goog-upload-url"]
-
-            put_headers = {
-                "content-type": content_type,
-                "x-goog-upload-command": "upload, finalize",
-                "x-goog-upload-offset": "0",
-            }
-            put_resp = session.post(upload_url, headers=put_headers, data=raw, timeout=60)
-            if not put_resp.ok:
-                raise RuntimeError(
-                    f"upload finalize failed: HTTP {put_resp.status_code} {put_resp.text[:300]}"
-                )
-            body = put_resp.json()
-            image_url = (
-                body["sessionStatus"]["additionalInfo"]
-                ["uploader_service.GoogleRupioAdditionalInfo"]
-                ["completionInfo"]["customerSpecificInfo"]["url"]
-            )
-            # Prefer full-resolution variant (s0).
-            parts = image_url.rstrip("/").split("/")
-            if parts:
-                return "/".join(parts[:-1]) + "/s0/" + parts[-1]
-            return image_url
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            _log(f"upload attempt {attempt + 1} failed: {exc}")
-            try:
-                from google.auth.transport.requests import Request
-
-                creds.refresh(Request())
-            except Exception:  # noqa: BLE001
-                pass
-            time.sleep(1 + attempt)
-    raise RuntimeError(f"blogger image upload failed after retries: {last_error}")
+def _run_git(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(Path.cwd()),
+        check=check,
+        text=True,
+        capture_output=True,
+    )
 
 
-def inject_hero_image(html: str, image_url: str, alt: str, replace_existing: bool = False) -> str:
-    """Prepend (or replace) a card-news thumbnail <img> at the top of the HTML."""
+def commit_and_push_thumb(image_path: Path, main: str) -> str:
+    """git add/commit/push the thumbnail; return the commit SHA."""
+    rel = image_path.as_posix()
+    _run_git(["add", "--", rel])
+    # If nothing changed (identical rebuild), reuse HEAD.
+    status = _run_git(["status", "--porcelain", "--", rel], check=False)
+    if not status.stdout.strip():
+        sha = _run_git(["rev-parse", "HEAD"]).stdout.strip()
+        _log(f"thumb unchanged, reusing HEAD {sha[:10]}")
+        return sha
+
+    msg = f"Add news thumbnail for {main}"
+    _run_git(["commit", "-m", msg])
+    sha = _run_git(["rev-parse", "HEAD"]).stdout.strip()
+
+    branch = _run_git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    push = _run_git(["push", "-u", "origin", branch], check=False)
+    if push.returncode != 0:
+        # Retry with short backoff (network flakes).
+        for delay in (4, 8, 16):
+            time.sleep(delay)
+            push = _run_git(["push", "-u", "origin", branch], check=False)
+            if push.returncode == 0:
+                break
+        else:
+            raise RuntimeError(f"git push failed: {push.stderr.strip()}")
+    _log(f"pushed thumb {rel} @ {sha[:10]}")
+    return sha
+
+
+def jsdelivr_url(sha: str, filename: str) -> str:
+    return JSDELIVR_TMPL.format(repo=REPO_SLUG, sha=sha, filename=filename)
+
+
+def inject_thumb_html(html: str, image_url: str, main: str, replace_existing: bool = False) -> str:
+    """Insert (or replace) the required post-thumb block at the top of the body."""
+    html = html or ""
     if replace_existing:
         html = re.sub(
-            r'<div class="post-hero"[^>]*>.*?</div>\s*',
+            r'<p>\s*<img class="post-thumb"[^>]*>\s*</p>\s*',
             "",
-            html or "",
+            html,
             count=1,
             flags=re.I | re.S,
         )
-        # Also drop a lone leading <img> left over from older inserts.
-        html = re.sub(r"^\s*<img\b[^>]*>\s*", "", html or "", count=1, flags=re.I)
-    elif re.search(r"<img\b", html or "", flags=re.I):
+        html = re.sub(
+            r'<div class="post-hero"[^>]*>.*?</div>\s*',
+            "",
+            html,
+            count=1,
+            flags=re.I | re.S,
+        )
+        html = re.sub(r"^\s*<img\b[^>]*>\s*", "", html, count=1, flags=re.I)
+    elif re.search(r'class="post-thumb"', html, flags=re.I):
         return html
-    safe_alt = escape(alt)
+
+    safe_alt = escape(main)
     safe_url = escape(image_url, quote=True)
-    hero = (
-        f'<div class="post-hero" style="margin:0 auto 1.5em auto;max-width:720px;text-align:center;">'
-        f'<img src="{safe_url}" alt="{safe_alt}" '
-        f'style="width:100%;max-width:720px;aspect-ratio:1/1;height:auto;display:block;margin:0 auto;border:0;" />'
-        f"</div>\n"
+    block = (
+        f'<p><img class="post-thumb" src="{safe_url}" alt="{safe_alt}" '
+        f'style="display:block;width:100%;max-width:100%;height:auto;'
+        f'margin:0 0 1em 0;border:0;" /></p>\n'
     )
-    return hero + (html or "")
-
-
-def build_and_host_hero(
-    creds: Credentials,
-    keyword: str,
-    category: str,
-    cache_dir: Path | None = None,
-) -> str:
-    """Generate + upload a hero image; return the hosted URL."""
-    cache_dir = cache_dir or IMAGE_CACHE_DIR
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    slug = re.sub(r"[^0-9A-Za-z가-힣]+", "-", keyword).strip("-")[:40] or "topic"
-    out_path = cache_dir / f"{slug}.png"
-    generate_header_image(keyword, category, out_path, seed=f"{category}:{keyword}")
-    url = upload_image_to_blogger(creds, out_path)
-    _log(f"hosted hero for '{keyword}': {url}")
-    return url
+    return block + html
 
 
 def content_has_image(html: str) -> bool:
     return bool(re.search(r"<img\b", html or "", flags=re.I))
+
+
+def verify_watermark(image_path: Path) -> bool:
+    """Cheap presence check: file exists, is JPG, and is non-trivial size.
+
+    The watermark itself is drawn in generate_news_thumbnail; refusing to
+    publish when generation somehow skipped that step is enforced by always
+    calling _draw_watermark before save, and by refusing empty/tiny files.
+    """
+    if not image_path.exists():
+        return False
+    if image_path.stat().st_size < 8_000:
+        return False
+    # Re-open and confirm bottom-right region is not uniform (chip drawn).
+    with Image.open(image_path) as im:
+        w, h = im.size
+        sample = im.crop((w - 180, h - 70, w - 20, h - 16)).convert("L")
+        extrema = sample.getextrema()
+        return (extrema[1] - extrema[0]) > 20
+
+
+def build_thumb_for_post(
+    title: str,
+    keyword: str,
+    category: str,
+    push: bool = True,
+) -> tuple[str, str, str]:
+    """Full pipeline: texts → JPG → (commit/push) → CDN URL.
+
+    Returns (cdn_url, main, sub).
+    """
+    main, sub = make_thumb_texts(title, keyword=keyword, category=category)
+    prompt = build_image_prompt(main, sub, category)
+    _log(f"prompt: {prompt}")
+
+    slug = slugify(keyword or main)
+    filename = f"thumb-{slug}.jpg"
+    out_path = IMAGE_DIR / filename
+    generate_news_thumbnail(main, sub, category, out_path, seed=f"{category}:{slug}")
+
+    if not verify_watermark(out_path):
+        raise RuntimeError(f"refusing to publish thumbnail without @욘두두 watermark: {out_path}")
+
+    if push:
+        sha = commit_and_push_thumb(out_path, main)
+    else:
+        sha = _run_git(["rev-parse", "HEAD"]).stdout.strip()
+
+    url = jsdelivr_url(sha, filename)
+    _log(f"thumb ready: {url}")
+    return url, main, sub

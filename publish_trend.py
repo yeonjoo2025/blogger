@@ -66,7 +66,7 @@ from googleapiclient.errors import HttpError
 
 from blogger_auth import load_credentials
 from content_writer import build_body_html, build_title
-from post_images import build_and_host_hero, inject_hero_image
+from post_images import build_thumb_for_post, inject_thumb_html
 from keyword_filter import (
     TopicCandidate,
     classify,
@@ -428,17 +428,25 @@ def take_over_live_placeholder(service, blog_id: str, post_id: str, title: str, 
     return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
 
 
-def attach_hero_image(creds, keyword: str, category: str, content: str) -> str:
-    """Generate + host a header image and prepend it to the HTML body.
+def attach_hero_image(creds, keyword: str, category: str, content: str, title: str = "") -> str:
+    """Generate a 16:9 news thumbnail, commit it to posts/images/, and
+    prepend the jsDelivr-backed <img class="post-thumb"> block.
 
     Failures are non-fatal: a missing image must never block publishing the
-    text content itself.
+    text content itself. `creds` is unused (CDN hosting, not Blogger upload)
+    but kept in the signature so call sites stay stable.
     """
+    del creds  # CDN path - OAuth not required for the image itself
     try:
-        url = build_and_host_hero(creds, keyword, category)
-        return inject_hero_image(content, url, alt=keyword)
+        url, main, _sub = build_thumb_for_post(
+            title=title or keyword,
+            keyword=keyword,
+            category=category,
+            push=True,
+        )
+        return inject_thumb_html(content, url, main)
     except Exception as exc:  # noqa: BLE001
-        log(f"  hero image skipped for '{keyword}': {exc}")
+        log(f"  news thumbnail skipped for '{keyword}': {exc}")
         return content
 
 
@@ -589,7 +597,9 @@ def main() -> None:
     for idx, topic in enumerate(final_topics, start=1):
         title = build_title(topic.keyword, topic.category, topic.news)
         content = build_body_html(topic.keyword, topic.category, topic.news)
-        content = attach_hero_image(creds, topic.keyword, topic.category, content)
+        content = attach_hero_image(
+            creds, topic.keyword, topic.category, content, title=title
+        )
         log(f"[{idx}/{len(final_topics)}] '{title}' (category={topic.category})")
 
         if placeholder_posts:
