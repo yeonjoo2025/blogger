@@ -76,6 +76,35 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
+# Default ON: automation must supply GenerateImage output under generated_images/
+# before a post can be published. Set BLOGGER_ALLOW_PILLOW_THUMB=1 only for local
+# emergency fallbacks (flat Pillow scenes are NOT acceptable for production).
+REQUIRE_AI_THUMB = os.environ.get("BLOGGER_REQUIRE_AI_THUMB", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+ALLOW_PILLOW_THUMB = os.environ.get("BLOGGER_ALLOW_PILLOW_THUMB", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+
+class MissingAIThumbError(RuntimeError):
+    """Raised when a production-quality AI plate is required but missing."""
+
+    def __init__(self, slug: str, prompt: str, dest: str, main: str, sub: str):
+        self.slug = slug
+        self.prompt = prompt
+        self.dest = dest
+        self.main = main
+        self.sub = sub
+        super().__init__(
+            f"AI thumbnail missing for slug={slug}. "
+            f"GenerateImage로 이미지를 만든 뒤 {dest} 에 저장하고 다시 실행하세요."
+        )
+
 IMAGE_DIR = Path("posts/images")
 GENERATED_DIR = Path("generated_images")  # git-ignored AI source plates
 REPO_SLUG = os.environ.get("BLOGGER_GITHUB_REPO", "yeonjoo2025/blogger")
@@ -760,6 +789,13 @@ def finalize_full_ai_thumbnail(src_path: Path, out_path: Path, width: int = 1280
     return out_path
 
 
+def has_ai_plate(slug: str) -> bool:
+    return bool(
+        _find_source(GENERATED_DIR, f"ai-thumb-{slug}")
+        or _find_source(GENERATED_DIR, f"bg-{slug}")
+    )
+
+
 def generate_news_thumbnail(
     main: str,
     sub: str,
@@ -773,8 +809,9 @@ def generate_news_thumbnail(
     title = title or main
     top, mid, accent, motif, scene = resolve_scene(keyword, title, category)
     slug = slugify(keyword, title)
+    prompt = build_image_prompt(main, sub, category, keyword=keyword, title=title)
     _log(f"scene[{motif}]: {scene}")
-    _log(f"prompt: {build_image_prompt(main, sub, category, keyword=keyword, title=title)}")
+    _log(f"prompt: {prompt}")
 
     full_ai = _find_source(GENERATED_DIR, f"ai-thumb-{slug}")
     if full_ai:
@@ -786,10 +823,23 @@ def generate_news_thumbnail(
         _log(f"using AI background plate bg-{slug}.* + direct headline overlay")
         im = Image.open(bg_plate).convert("RGB")
         im = ImageOps.fit(im, (1280, 720), method=Image.Resampling.LANCZOS)
-    else:
-        _log("no AI plate found - using varied Pillow fallback scene")
-        im = paint_topic_background(keyword, title, category, seed=seed or f"{motif}:{slug}")
+        return compose_pillow_headline(im, main, sub, accent, out_path)
 
+    if REQUIRE_AI_THUMB and not ALLOW_PILLOW_THUMB:
+        GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+        dest = str(GENERATED_DIR / f"ai-thumb-{slug}.png")
+        _log("ERROR: production AI thumbnail plate missing - refusing Pillow fallback")
+        _log(f"REQUIRED_SLUG={slug}")
+        _log(f"REQUIRED_SAVE_PATH={dest}")
+        _log(f"REQUIRED_MAIN={main}")
+        _log(f"REQUIRED_SUB={sub}")
+        _log("REQUIRED_IMAGE_PROMPT_BEGIN")
+        _log(prompt)
+        _log("REQUIRED_IMAGE_PROMPT_END")
+        raise MissingAIThumbError(slug=slug, prompt=prompt, dest=dest, main=main, sub=sub)
+
+    _log("no AI plate found - using varied Pillow fallback scene")
+    im = paint_topic_background(keyword, title, category, seed=seed or f"{motif}:{slug}")
     return compose_pillow_headline(im, main, sub, accent, out_path)
 
 
@@ -879,6 +929,8 @@ def build_thumb_for_post(
 
     - If the thumbnail file already exists, it is kept as-is unless
       `force=True` is passed explicitly.
+    - When AI thumbs are required, a previously saved Pillow-only JPG is
+      NOT reused until `generated_images/ai-thumb-{slug}.*` exists.
     - Slugs in `PROTECTED_SLUGS` are never regenerated, even with
       `force=True`.
     """
@@ -886,6 +938,18 @@ def build_thumb_for_post(
     slug = slugify(keyword or main, title)
     filename = f"thumb-{slug}.jpg"
     out_path = IMAGE_DIR / filename
+    ai_ready = has_ai_plate(slug)
+
+    # Pillow-only leftovers must not block a proper AI upgrade.
+    if (
+        out_path.exists()
+        and REQUIRE_AI_THUMB
+        and not ALLOW_PILLOW_THUMB
+        and not ai_ready
+        and slug not in PROTECTED_SLUGS
+    ):
+        _log(f"existing {filename} has no AI plate - requiring GenerateImage upgrade")
+        force = True
 
     if out_path.exists():
         if slug in PROTECTED_SLUGS:

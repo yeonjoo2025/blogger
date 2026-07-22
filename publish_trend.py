@@ -66,7 +66,7 @@ from googleapiclient.errors import HttpError
 
 from blogger_auth import load_credentials
 from content_writer import build_body_html, build_title
-from post_images import build_thumb_for_post, inject_thumb_html
+from post_images import MissingAIThumbError, build_thumb_for_post, inject_thumb_html
 from keyword_filter import (
     TopicCandidate,
     classify,
@@ -581,9 +581,9 @@ def attach_hero_image(creds, keyword: str, category: str, content: str, title: s
     """Generate a 16:9 news thumbnail, commit it to posts/images/, and
     prepend the jsDelivr-backed <img class="post-thumb"> block.
 
-    Failures are non-fatal: a missing image must never block publishing the
-    text content itself. `creds` is unused (CDN hosting, not Blogger upload)
-    but kept in the signature so call sites stay stable.
+    AI plate is mandatory for production (see MissingAIThumbError). Other
+    unexpected failures still skip the image rather than killing text
+    drafting, except MissingAIThumbError which must abort publish.
     """
     del creds  # CDN path - OAuth not required for the image itself
     try:
@@ -594,9 +594,25 @@ def attach_hero_image(creds, keyword: str, category: str, content: str, title: s
             push=True,
         )
         return inject_thumb_html(content, url, main)
+    except MissingAIThumbError:
+        raise
     except Exception as exc:  # noqa: BLE001
         log(f"  news thumbnail skipped for '{keyword}': {exc}")
         return content
+
+
+def assert_publish_quality(post: dict, expected_labels: list[str], content: str) -> None:
+    """Fail loud if labels/thumbnail were dropped during write."""
+    got = list(post.get("labels") or [])
+    if len(got) < min(15, len(expected_labels)):
+        raise RuntimeError(
+            f"labels missing/too few after publish: got={got!r} expected~{expected_labels!r}"
+        )
+    if 'class="post-thumb"' not in (content or "") and 'class="post-thumb"' not in (post.get("content") or ""):
+        raise RuntimeError("post-thumb image missing from published content")
+    if "cdn.jsdelivr.net/gh/yeonjoo2025/blogger@" not in (post.get("content") or content or ""):
+        raise RuntimeError("thumbnail CDN URL missing from published content")
+    log(f"  quality ok: labels={len(got)}, thumb=present, url={post.get('url')}")
 
 
 def _slugify(keyword: str) -> str:
@@ -756,13 +772,31 @@ def main() -> None:
     for idx, topic in enumerate(final_topics, start=1):
         title = build_title(topic.keyword, topic.category, topic.news)
         content = build_body_html(topic.keyword, topic.category, topic.news)
-        content = attach_hero_image(
-            creds, topic.keyword, topic.category, content, title=title
-        )
         labels = build_labels(topic.keyword, topic.category, news=topic.news)
+        if len(labels) < 15:
+            raise SystemExit(
+                f"refusing to publish with too few labels ({len(labels)}): {labels}"
+            )
+        try:
+            content = attach_hero_image(
+                creds, topic.keyword, topic.category, content, title=title
+            )
+        except MissingAIThumbError as missing:
+            log(
+                "발행 중단: AI 썸네일이 없습니다. GenerateImage로 만든 뒤 "
+                f"{missing.dest} 에 저장하고 python3 publish_trend.py 를 다시 실행하세요."
+            )
+            log(f"REQUIRED_SLUG={missing.slug}")
+            log(f"REQUIRED_SAVE_PATH={missing.dest}")
+            log("REQUIRED_IMAGE_PROMPT_BEGIN")
+            log(missing.prompt)
+            log("REQUIRED_IMAGE_PROMPT_END")
+            sys.exit(2)
+        if 'class="post-thumb"' not in content:
+            raise SystemExit("refusing to publish without post-thumb image in content")
         log(
             f"[{idx}/{len(final_topics)}] '{title}' "
-            f"(category={topic.category}, labels={labels})"
+            f"(category={topic.category}, labels={len(labels)}:{labels})"
         )
 
         if placeholder_posts:
@@ -772,6 +806,7 @@ def main() -> None:
                 post = take_over_live_placeholder(
                     service, blog_id, shell_id, title, content, labels=labels
                 )
+                assert_publish_quality(post, labels, content)
                 log(
                     f"  filled in empty LIVE post {shell_id} via patch: {post.get('url')} "
                     f"labels={post.get('labels')}"
@@ -794,6 +829,7 @@ def main() -> None:
                 post = take_over_draft_post(
                     service, blog_id, draft_id, title, content, labels=labels
                 )
+                assert_publish_quality(post, labels, content)
                 log(
                     f"  filled in human-created draft {draft_id} and published: "
                     f"{post.get('url')} labels={post.get('labels')}"
@@ -824,6 +860,7 @@ def main() -> None:
 
         try:
             post = publish_new_post(service, blog_id, title, content, labels=labels)
+            assert_publish_quality(post, labels, content)
             log(f"  published: {post.get('url')} labels={post.get('labels')}")
             remaining_quota -= 1
             published_count += 1
