@@ -139,12 +139,17 @@ def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple
     main = re.sub(r"\s*무슨(\s*일이길래)?\??\s*$", "", main).strip() or main_src[:8]
 
     # Sub: meaningful remainder of the title after the keyword, else a
-    # category cue. Strip pipeline boilerplate and dangling parentheses.
+    # category cue. Prefer the clause after an ellipsis when present
+    # (common in Korean news titles).
     remainder = title
     for token in (main_src, keyword, head):
         if token and token in remainder:
             remainder = remainder.replace(token, "", 1)
             break
+    if "…" in remainder or "..." in remainder:
+        tail = re.split(r"…|\.\.\.", remainder, maxsplit=1)[-1].strip()
+        if len(re.findall(r"[가-힣]", tail)) >= 5:
+            remainder = tail
     remainder = re.sub(r"[\(（][^\)）]{0,24}[\)）]", " ", remainder)
     remainder = re.sub(
         r"(무슨 일이길래\??|정리|확인·대응법|대응 전략|대응법|지갑에 영향|투자자 영향과)",
