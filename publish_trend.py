@@ -551,22 +551,33 @@ def main() -> None:
     new_posts_today = count_new_posts_today(recent_posts, now)
     remaining_quota = max(0, MAX_NEW_POSTS_PER_DAY - new_posts_today)
     api_blocked = remaining_quota <= 0 or load_quota_exhausted_today(now)
-    if api_blocked:
-        # Per operating rules: once the daily write quota/restriction is hit,
-        # do not create new posts and do not update existing ones. Exit now
-        # and retry on the next cron cycle.
+
+    # Empty LIVE shells / human drafts can still be filled via patch/update
+    # even when posts.insert is banned. Prefer that path over a hard stop.
+    placeholder_posts = list_placeholder_live_posts(service, blog_id)
+    draft_posts = list_draft_posts(service, blog_id)
+    can_fill_shells = bool(placeholder_posts or draft_posts)
+
+    if api_blocked and not can_fill_shells:
         log(
             "생성/업데이트 없이 종료: today's Blogger write quota/restriction is already "
             f"exhausted (new posts today={new_posts_today}/{MAX_NEW_POSTS_PER_DAY}, "
-            f"quota_state_exhausted={load_quota_exhausted_today(now)}). "
-            "Will retry next cycle."
+            f"quota_state_exhausted={load_quota_exhausted_today(now)}) and no empty "
+            "placeholder/draft shells are available. Will retry next cycle."
         )
         return
 
-    log(
-        f"new posts published today (KST): {new_posts_today}/{MAX_NEW_POSTS_PER_DAY} "
-        f"-> {remaining_quota} new-post slot(s) left for this run"
-    )
+    if api_blocked and can_fill_shells:
+        log(
+            "insert quota/restriction is active, but empty placeholder/draft shell(s) "
+            f"exist (placeholders={len(placeholder_posts)}, drafts={len(draft_posts)}) - "
+            "will fill via patch/update only (no posts.insert)"
+        )
+    else:
+        log(
+            f"new posts published today (KST): {new_posts_today}/{MAX_NEW_POSTS_PER_DAY} "
+            f"-> {remaining_quota} new-post slot(s) left for this run"
+        )
 
     candidates = build_candidates(now)
     log(f"{len(candidates)} candidates qualified after news-grounded filtering")
@@ -580,8 +591,6 @@ def main() -> None:
     # Prefer filling in human-created empty LIVE posts via patch (empirically
     # works under the account-wide insert ban), then DRAFT posts via
     # update+publish, and only then fall back to posts.insert / pending_posts.
-    placeholder_posts = list_placeholder_live_posts(service, blog_id)
-    draft_posts = list_draft_posts(service, blog_id)
     if placeholder_posts:
         log(
             f"found {len(placeholder_posts)} empty LIVE placeholder post(s) - "
