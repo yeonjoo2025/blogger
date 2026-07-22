@@ -105,13 +105,21 @@ def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple
     head = re.sub(r"\s*[\(（][^\)）]{0,24}[\)）]\s*$", "", head).strip()
     main_src = keyword or head or title
     main_src = re.sub(r"\s*[\(（][^\)）]{0,24}[\)）]\s*$", "", main_src).strip()
-    # If the keyword alone is too short (e.g. "메시"), pull a few more
-    # meaningful Hangul tokens from the title to reach ~8 chars.
-    if len(re.findall(r"[가-힣A-Za-z0-9]", main_src)) < 5:
+    main_src = re.sub(r"\s*무슨\s*일이길래\??\s*", " ", main_src).strip()
+
+    stop = {
+        "무슨", "일이길래", "정리", "확인", "대응법", "대응", "전략", "영향",
+        "지갑에", "투자자", "방법", "있나", "개월", "결정", "후", "속", "3개월",
+    }
+    # Expand only ultra-short proper names (e.g. "메시") when the title is a
+    # real news headline - never pad with our pipeline boilerplate.
+    hangul_count = len(re.findall(r"[가-힣]", main_src))
+    is_pipeline_title = "무슨 일이길래" in title
+    if hangul_count <= 2 and not is_pipeline_title:
         extras = re.findall(r"[가-힣A-Za-z0-9]{2,}", title)
         built = main_src
         for tok in extras:
-            if tok in built:
+            if tok in built or tok in stop:
                 continue
             trial = f"{built} {tok}".strip()
             if len(trial) > 12:
@@ -121,6 +129,7 @@ def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple
                 break
         main_src = built
     main = _clamp_chars(main_src, target=8, hard_max=12)
+    main = re.sub(r"\s*무슨(\s*일이길래)?\??\s*$", "", main).strip() or main_src[:8]
 
     # Sub: meaningful remainder of the title after the keyword, else a
     # category cue. Strip pipeline boilerplate and dangling parentheses.
