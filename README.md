@@ -26,14 +26,14 @@ python format_latest_post_for_slack.py
 
 | Name | Value |
 |------|--------|
-| `BLOGGER_TOKEN_JSON` | 로컬 `token.json` **전체 JSON 내용** |
+| `BLOGGER_TOKEN_JSON` 또는 `BLOGGER_TOKEN` | 로컬 `token.json` **전체 JSON 내용** |
 
 선택:
 
 | Name | Value |
 |------|--------|
-| `BLOGGER_CLIENT_SECRET_JSON` | `client_secret.json` 전체 JSON |
+| `BLOGGER_CLIENT_SECRET_JSON` 또는 `BLOGGER_CLIENT_SECRET` | `client_secret.json` 전체 JSON |
 
-스크립트는 `token.json`이 없으면 `BLOGGER_TOKEN_JSON`에서 파일을 만듭니다.
+스크립트는 `token.json`이 없으면 `BLOGGER_TOKEN_JSON` 또는 `BLOGGER_TOKEN`에서 파일을 만듭니다.
 
 시크릿 등록 후 자동화를 **새로 Run** 하세요 (이미 떠 있던 run에는 시크릿이 안 들어갈 수 있습니다).
