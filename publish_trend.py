@@ -72,6 +72,7 @@ from keyword_filter import (
     classify,
     group_trend_items,
     headline_coherence,
+    is_earnings_topic,
     is_near_duplicate,
     is_qualified,
     normalize_keyword,
@@ -352,8 +353,55 @@ def count_new_posts_today(recent_posts: list[dict], now: datetime) -> int:
     return count
 
 
-def publish_new_post(service, blog_id: str, title: str, content: str) -> dict:
-    body = {"kind": "blogger#post", "blog": {"id": blog_id}, "title": title, "content": content}
+def build_labels(keyword: str, category: str) -> list[str]:
+    """Blogger labels: category + 1~3 concise keyword tags.
+
+    Avoids long sentence-like tags and entertainment/gossip noise. Keeps
+    order stable: category first, then distinctive keyword tokens.
+    """
+    labels: list[str] = []
+    cat = (category or "").strip()
+    if cat:
+        labels.append(cat)
+
+    # Split keyword into short tokens; prefer multi-char hangul/latin chunks.
+    raw_tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", keyword or "")
+    skip = {
+        "무슨", "일이길래", "정리", "확인", "대응", "방법", "영향", "있나",
+        "이슈", "관련", "오늘", "내일", "실시간",
+    }
+    for tok in raw_tokens:
+        clean = tok.strip()
+        if not clean or clean in skip or clean in labels:
+            continue
+        # Drop pure noise like single-letter tickers already covered elsewhere.
+        if len(clean) > 20:
+            continue
+        labels.append(clean)
+        if len(labels) >= 4:  # category + up to 3 keyword tags
+            break
+
+    # Earnings posts get an explicit topic tag when not already present.
+    if is_earnings_topic(keyword) and "실적발표" not in labels:
+        if len(labels) < 4:
+            labels.append("실적발표")
+        else:
+            labels[-1] = "실적발표"
+
+    return labels[:4]
+
+
+def publish_new_post(
+    service, blog_id: str, title: str, content: str, labels: list[str] | None = None
+) -> dict:
+    body: dict = {
+        "kind": "blogger#post",
+        "blog": {"id": blog_id},
+        "title": title,
+        "content": content,
+    }
+    if labels:
+        body["labels"] = labels
     return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
 
 
@@ -413,18 +461,43 @@ def list_placeholder_live_posts(service, blog_id: str, max_pages: int = 5) -> li
     return posts
 
 
-def take_over_draft_post(service, blog_id: str, draft_id: str, title: str, content: str) -> dict:
+def take_over_draft_post(
+    service,
+    blog_id: str,
+    draft_id: str,
+    title: str,
+    content: str,
+    labels: list[str] | None = None,
+) -> dict:
     """Fill in a human-created draft with generated content and publish it."""
-    body = {"kind": "blogger#post", "id": draft_id, "blog": {"id": blog_id}, "title": title, "content": content}
+    body: dict = {
+        "kind": "blogger#post",
+        "id": draft_id,
+        "blog": {"id": blog_id},
+        "title": title,
+        "content": content,
+    }
+    if labels:
+        body["labels"] = labels
     service.posts().update(blogId=blog_id, postId=draft_id, body=body).execute()
     return service.posts().publish(blogId=blog_id, postId=draft_id).execute()
 
 
-def take_over_live_placeholder(service, blog_id: str, post_id: str, title: str, content: str) -> dict:
-    """Overwrite an empty LIVE post's title+body via patch (confirmed to
-    work even when posts.insert is blocked by the account-wide restriction).
+def take_over_live_placeholder(
+    service,
+    blog_id: str,
+    post_id: str,
+    title: str,
+    content: str,
+    labels: list[str] | None = None,
+) -> dict:
+    """Overwrite an empty LIVE post's title+body(+labels) via patch
+    (confirmed to work even when posts.insert is blocked by the
+    account-wide restriction).
     """
-    body = {"title": title, "content": content}
+    body: dict = {"title": title, "content": content}
+    if labels:
+        body["labels"] = labels
     return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
 
 
@@ -610,14 +683,23 @@ def main() -> None:
         content = attach_hero_image(
             creds, topic.keyword, topic.category, content, title=title
         )
-        log(f"[{idx}/{len(final_topics)}] '{title}' (category={topic.category})")
+        labels = build_labels(topic.keyword, topic.category)
+        log(
+            f"[{idx}/{len(final_topics)}] '{title}' "
+            f"(category={topic.category}, labels={labels})"
+        )
 
         if placeholder_posts:
             shell = placeholder_posts.pop(0)
             shell_id = shell.get("id")
             try:
-                post = take_over_live_placeholder(service, blog_id, shell_id, title, content)
-                log(f"  filled in empty LIVE post {shell_id} via patch: {post.get('url')}")
+                post = take_over_live_placeholder(
+                    service, blog_id, shell_id, title, content, labels=labels
+                )
+                log(
+                    f"  filled in empty LIVE post {shell_id} via patch: {post.get('url')} "
+                    f"labels={post.get('labels')}"
+                )
                 published_count += 1
                 if idx < len(final_topics):
                     time.sleep(2)
@@ -633,8 +715,13 @@ def main() -> None:
             draft = draft_posts.pop(0)
             draft_id = draft.get("id")
             try:
-                post = take_over_draft_post(service, blog_id, draft_id, title, content)
-                log(f"  filled in human-created draft {draft_id} and published: {post.get('url')}")
+                post = take_over_draft_post(
+                    service, blog_id, draft_id, title, content, labels=labels
+                )
+                log(
+                    f"  filled in human-created draft {draft_id} and published: "
+                    f"{post.get('url')} labels={post.get('labels')}"
+                )
                 published_count += 1
                 new_posts_today += 1
                 if idx < len(final_topics):
@@ -660,8 +747,8 @@ def main() -> None:
             return
 
         try:
-            post = publish_new_post(service, blog_id, title, content)
-            log(f"  published: {post.get('url')}")
+            post = publish_new_post(service, blog_id, title, content, labels=labels)
+            log(f"  published: {post.get('url')} labels={post.get('labels')}")
             remaining_quota -= 1
             published_count += 1
             new_posts_today += 1
