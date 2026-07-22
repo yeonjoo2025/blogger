@@ -365,15 +365,29 @@ def _extract_angle(keyword: str, news: list[NewsRef]) -> str:
     headlines so the title reflects this specific topic's content instead
     of a bare category label. Returns "" when nothing usable is found, or
     when the match is already part of the keyword itself.
+
+    A fragment must appear in at least two recent headlines so a one-off
+    amount like "110만원" from a single deposit-rate story cannot warp the
+    title of an unrelated/generic keyword.
     """
-    for item in news[:5]:
+    candidates: list[str] = []
+    for item in news[:8]:
         match = _ANGLE_RE.search(item.title)
         if not match:
             continue
         frag = re.sub(r"\s+", "", match.group(0))
         if frag and frag not in keyword and len(frag) <= 10:
-            return frag
-    return ""
+            candidates.append(frag)
+    if not candidates:
+        return ""
+    # Prefer the most repeated concrete fragment across headlines.
+    counts: dict[str, int] = {}
+    for frag in candidates:
+        counts[frag] = counts.get(frag, 0) + 1
+    best, best_n = max(counts.items(), key=lambda kv: (kv[1], len(kv[0])))
+    if best_n < 2:
+        return ""
+    return best
 
 
 def build_title(keyword: str, category: str, news: list[NewsRef] | None = None) -> str:

@@ -552,21 +552,22 @@ def main() -> None:
     remaining_quota = max(0, MAX_NEW_POSTS_PER_DAY - new_posts_today)
     api_blocked = remaining_quota <= 0 or load_quota_exhausted_today(now)
     if api_blocked:
+        # Per operating rules: once the daily write quota/restriction is hit,
+        # do not create new posts and do not update existing ones. Exit now
+        # and retry on the next cron cycle.
         log(
-            "API insert looks blocked today (daily quota used up, or a previous run already "
-            "hit 403/429) - will still draft the best qualifying topic under pending_posts/ "
-            "for manual posting, without calling the write API again"
+            "생성/업데이트 없이 종료: today's Blogger write quota/restriction is already "
+            f"exhausted (new posts today={new_posts_today}/{MAX_NEW_POSTS_PER_DAY}, "
+            f"quota_state_exhausted={load_quota_exhausted_today(now)}). "
+            "Will retry next cycle."
         )
-    else:
-        log(
-            f"new posts published today (KST): {new_posts_today}/{MAX_NEW_POSTS_PER_DAY} "
-            f"-> {remaining_quota} new-post slot(s) left for this run"
-        )
+        return
 
-    # Even when the write API is known-blocked, we still run the full
-    # discovery/filtering pipeline below: the point of pending_posts/ is to
-    # make sure a genuinely qualified topic's content is never lost just
-    # because Blogger's API happens to be unavailable this cycle.
+    log(
+        f"new posts published today (KST): {new_posts_today}/{MAX_NEW_POSTS_PER_DAY} "
+        f"-> {remaining_quota} new-post slot(s) left for this run"
+    )
+
     candidates = build_candidates(now)
     log(f"{len(candidates)} candidates qualified after news-grounded filtering")
 
@@ -638,11 +639,16 @@ def main() -> None:
                 )
 
         if api_blocked or remaining_quota <= 0:
-            reason = "api_already_blocked_today" if api_blocked else "quota_used_up_mid_run"
-            path = save_pending_draft(now, topic, title, content, reason)
-            log(f"  write API unavailable - saved draft for manual posting: {path}")
-            drafted_count += 1
-            continue
+            log(
+                "생성/업데이트 없이 종료: write API unavailable or assumed daily "
+                "new-post quota used up mid-run. Stopping without further creates "
+                "or updates."
+            )
+            log(
+                f"run finished - published {published_count} new post(s), "
+                f"drafted {drafted_count} pending post(s) for manual posting"
+            )
+            return
 
         try:
             post = publish_new_post(service, blog_id, title, content)
@@ -654,13 +660,16 @@ def main() -> None:
             status = getattr(exc.resp, "status", None)
             if status in (403, 429):
                 mark_quota_exhausted_today(now, new_posts_today)
-                api_blocked = True
-                path = save_pending_draft(now, topic, title, content, f"http_{status}")
                 log(
-                    f"  new post blocked (HTTP {status}); marking today's quota exhausted, "
-                    f"saved draft for manual posting: {path}"
+                    f"생성/업데이트 없이 종료: new post blocked (HTTP {status}); "
+                    "marking today's quota exhausted and stopping without further "
+                    "creates or updates."
                 )
-                continue
+                log(
+                    f"run finished - published {published_count} new post(s), "
+                    f"drafted {drafted_count} pending post(s) for manual posting"
+                )
+                return
             log(f"  publish failed (HTTP {status}), skipping this topic")
             continue
 

@@ -64,7 +64,18 @@ INCLUDE_CATEGORIES: dict[str, list[str]] = {
 
 MIN_NEWS_FOR_CONFIDENCE = 3
 MIN_NET_SCORE = 3
-MIN_COHERENCE = 0.35
+# Generic nouns that only share a common word across unrelated articles
+# (e.g. "이자" spanning 예금금리·카드론·시금고 기사) need a higher bar.
+MIN_COHERENCE = 0.50
+MIN_COHERENCE_BROAD = 0.65
+MIN_COHERENCE_SHORT = 0.60
+
+# Bare topic words that almost always pull multi-event headline bags.
+BROAD_GENERIC_TERMS = {
+    "이자", "금리", "대출", "주가", "주식", "환율", "세금", "물가", "보험",
+    "투자", "부동산", "은행", "예금", "적금", "채권", "펀드", "코인", "증시",
+    "배당", "연체", "파산", "지원금", "보조금", "환급",
+}
 
 _TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9]{2,}")
 
@@ -149,8 +160,19 @@ def is_qualified(keyword: str, news: list[NewsRef]) -> tuple[bool, str | None, s
         return False, None, "entertainment/sports signal dominates"
 
     coherence = headline_coherence(keyword, news)
-    if coherence < MIN_COHERENCE:
-        return False, None, f"headline_coherence={coherence:.2f} < {MIN_COHERENCE} (too scattered, likely a generic term)"
+    norm = normalize_keyword(keyword)
+    min_coherence = MIN_COHERENCE
+    if norm in BROAD_GENERIC_TERMS:
+        min_coherence = MIN_COHERENCE_BROAD
+    elif len(norm) <= 2:
+        min_coherence = MIN_COHERENCE_SHORT
+    if coherence < min_coherence:
+        return (
+            False,
+            None,
+            f"headline_coherence={coherence:.2f} < {min_coherence:.2f} "
+            f"(too scattered, likely a generic term)",
+        )
 
     return True, category, f"include={include_hits}, exclude={exclude_hits}, coherence={coherence:.2f}"
 
