@@ -1,26 +1,70 @@
 """Korean news-style (16:9) thumbnail generation for Blogger posts.
 
-Pipeline (runs right before a post is published / patched):
-  1. Derive short main (~8 chars) + sub (~14 chars) Korean lines.
-  2. Pick a *topic-specific* visual scene from the keyword/title (not a
-     fixed category template), then either:
-       a) use a pre-rendered AI background at posts/images/bg-{slug}.jpg, or
-       b) paint a content-matched cinematic scene with Pillow motifs.
-  3. Composite a dark lower-third banner + white/yellow Korean type +
-     required "@욘두두" watermark.
-  4. Save JPG 1280px under posts/images/thumb-{slug}.jpg, git commit/push,
-     build jsDelivr CDN URL, prepend <img class="post-thumb">.
+## 썸네일 생성 (필수)
 
-Image-generation prompt brief (background plate, no on-image body copy):
+글마다 개성 있는 뉴스 썸네일 1장을 만든다. 목표는 "배경 사진/장면 안에 한글
+헤드라인이 자연스럽게 들어간" 방송용 썸네일이다. 하단 반투명 배너를 따로
+덮어씌우지 않는다 — 텍스트는 (가능하면) 이미지 생성 단계에서 배경과 함께
+렌더링되거나, Pillow 폴백에서는 두꺼운 외곽선(stroke) 타이포로 장면 위에
+직접 얹는다.
 
-  Cinematic Korean news broadcast B-roll, 16:9, {scene}, high contrast,
-  darker lower third ready for caption overlay. No text, no letters,
-  no logos, no watermarks, no realistic celebrity or recognizable person
-  face, no long paragraphs.
+### 1) 텍스트 추출
+- 메인 제목: 글 핵심 8~14자 (예: 메시 국가대표 은퇴)
+- 서브 문구: 상황 한 줄 12~20자 (예: 월드컵 결승 패배 후 마지막 인사)
+- 파일명: ASCII만 사용 (예: thumb-messi-argentina.jpg) — 한글 파일명 금지
+
+### 2) 이미지 생성 프롬프트 템플릿 (`build_image_prompt`)
+
+  Korean news thumbnail, 16:9, cinematic and unique to this topic.
+  Background must visually match the article subject (not generic gradient).
+  Compose large bold Korean headline INTO the scene itself (not a separate
+  UI card): "{main}".
+  Smaller Korean subheadline integrated in the composition: "{sub}".
+  High contrast, dramatic lighting, broadcast sports/tech/politics news style.
+  No logos, no brand marks, no realistic celebrity face likeness, no long
+  paragraphs.
+  Do NOT add a flat translucent bottom bar overlay after generation.
+
+주제별 배경 힌트 예시 (`TOPIC_SCENES`):
+  - 야구: 우천 야구장, 마운드, 야간 조명
+  - 축구/은퇴: 경기장 밤 분위기, 유니폼/트로피 상징 (실존 얼굴 금지)
+  - 국방/정치: 스마트 캠퍼스·훈련장 느낌의 상징 장면
+  - AI/IT: 회로·네온·추상 테크 장면 (로고 금지)
+
+### 3) 소스 우선순위 (자동화 파이프라인이 실제로 쓰는 순서)
+  1. `generated_images/ai-thumb-{slug}.*` — 텍스트까지 완성된 AI 생성 이미지
+     (에이전트가 GenerateImage로 위 프롬프트를 그대로 사용해 만든 결과).
+     리사이즈 + 워터마크만 적용해 그대로 사용한다.
+  2. `generated_images/bg-{slug}.*` — 텍스트 없는 배경판. Pillow로 헤드라인을
+     장면 위에 직접(외곽선 타이포, 띠 없음) 합성한다.
+  3. API 키/생성 이미지가 전혀 없을 때만 Pillow 폴백: `paint_topic_background`
+     로 글마다 배경색·아이콘·구도를 다르게 그리고, 문구를 이미지 안에 크게
+     직접 얹는다. 밋밋한 단색 + 배너 반복 금지.
+  (`generated_images/` 는 git-ignore 대상 — 커밋되는 것은 최종 결과물인
+  `posts/images/thumb-{slug}.jpg` 뿐이다.)
+
+### 4) 후처리
+  - 가로 1280px JPG 압축
+  - 우측 하단에만 "@욘두두" 워터마크 추가 (작은 반투명 라벨만 허용)
+  - 저장 경로: posts/images/thumb-{slug}.jpg (slug는 ASCII)
+  - commit/push 후 URL:
+    https://cdn.jsdelivr.net/gh/yeonjoo2025/blogger@{commitSHA}/posts/images/thumb-{slug}.jpg
+
+### 5) 본문 삽입
+  <p><img class="post-thumb" src="{URL}" alt="{메인제목}"
+     style="display:block;width:100%;max-width:100%;height:auto;
+     margin:0 0 1em 0;border:0;" /></p>
+
+### 6) 금지 / 보호
+  - `PROTECTED_SLUGS` 에 있는 슬러그의 썸네일 파일은 이미 존재하면 절대
+    재생성/덮어쓰기하지 않는다 (force=True 여도 무시).
+  - 이미 썸네일 파일이 있는 글은 기본적으로 새로 만들지 않고 그대로 유지한다
+    (`build_thumb_for_post(..., force=True)` 를 명시해야만 재생성).
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import random
@@ -33,8 +77,17 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 IMAGE_DIR = Path("posts/images")
+GENERATED_DIR = Path("generated_images")  # git-ignored AI source plates
 REPO_SLUG = os.environ.get("BLOGGER_GITHUB_REPO", "yeonjoo2025/blogger")
 JSDELIVR_TMPL = "https://cdn.jsdelivr.net/gh/{repo}@{sha}/posts/images/{filename}"
+
+# Thumbnails that must never be regenerated/overwritten by automation once
+# created, regardless of --replace / force flags.
+PROTECTED_SLUGS: frozenset[str] = frozenset({
+    "kt-doosan",
+    "messi-argentina",
+    "military-academy",
+})
 
 # Topic motif → (palette top/mid/accent, English scene for AI / Pillow)
 # More specific / distinctive keys are listed first. Matching prefers the
@@ -59,11 +112,11 @@ TOPIC_SCENES: list[tuple[tuple[str, ...], tuple[int, int, int], tuple[int, int, 
     (("근저당", "부동산", "전세", "주택담보", "아파트"), (30, 28, 40), (80, 70, 90), (255, 214, 60),
      "house", "apartment complex silhouette at night, warm window light, mortgage document mood, no people"),
     (("육사", "사관학교", "통합 국군", "국군사관"), (20, 28, 24), (50, 70, 50), (220, 200, 120),
-     "academy", "military academy campus at dawn, parade ground flagpoles silhouette, solemn, no people faces"),
-    (("야구", "두산", "kt vs", "kt ", "홈런", "우천"), (10, 16, 40), (30, 50, 100), (255, 214, 60),
-     "baseball", "baseball stadium night under rain lights, empty diamond, dramatic sports broadcast, no player faces"),
+     "academy", "smart military academy campus at dawn, parade ground flagpoles silhouette, solemn, no people faces"),
+    (("야구", "두산", "kt vs", "kt ", "홈런", "우천", "연장"), (10, 16, 40), (30, 50, 100), (255, 214, 60),
+     "baseball", "baseball stadium at night under rain and floodlights, empty diamond, dramatic sports broadcast, no player faces"),
     (("메시", "축구", "월드컵", "국가대표", "은퇴"), (20, 30, 20), (40, 80, 40), (255, 214, 60),
-     "football", "empty football stadium at sunset, spotlight on center circle, retirement farewell mood, no player faces"),
+     "football", "empty football stadium at sunset, spotlight on center circle, jersey and trophy silhouette, retirement farewell mood, no player faces"),
     (("증시", "주가", "코스피", "코스닥", "매수", "매도"), (8, 16, 28), (20, 60, 50), (255, 80, 70),
      "candles", "dramatic stock market candlestick charts glowing red and green, trading floor bokeh, no people"),
     (("대출", "세금"), (24, 36, 44), (50, 90, 100), (255, 214, 60),
@@ -78,11 +131,15 @@ _DEFAULT_SCENE = (
     "cinematic Korean newsroom abstract light leaks, high contrast broadcast graphics, no people",
 )
 
-_BG_PROMPT_TMPL = (
-    "Cinematic Korean news broadcast B-roll background plate, 16:9 landscape, "
-    "{scene}, high contrast, photogenic, darker empty lower third for caption overlay. "
-    "No text, no letters, no captions, no logos, no watermarks, "
-    "no realistic celebrity face, no recognizable person face, no long paragraphs."
+# Text baked directly into the generated scene - no separate banner overlay.
+_IMAGE_PROMPT_TMPL = (
+    "Korean news thumbnail, 16:9, cinematic and unique to this topic. "
+    "Background must visually match the article subject (not generic gradient): {scene}. "
+    'Compose large bold Korean headline INTO the scene itself (not a separate UI card): "{main}". '
+    'Smaller Korean subheadline integrated in the composition: "{sub}". '
+    "High contrast, dramatic lighting, broadcast sports/tech/politics news style. "
+    "No logos, no brand marks, no realistic celebrity face likeness, no long paragraphs. "
+    "Do NOT add a flat translucent bottom bar overlay after generation."
 )
 
 
@@ -139,21 +196,10 @@ def resolve_scene(keyword: str, title: str = "", category: str = "") -> tuple[
     return top, mid, accent, motif, scene
 
 
-def build_background_prompt(keyword: str, title: str = "", category: str = "") -> str:
-    _t, _m, _a, _motif, scene = resolve_scene(keyword, title, category)
-    return _BG_PROMPT_TMPL.format(scene=scene)
-
-
 def build_image_prompt(main: str, sub: str, category: str, keyword: str = "", title: str = "") -> str:
-    """Full news-thumb prompt (for logging / external AI). Korean lines included."""
+    """Full news-thumb prompt: text baked into the scene, no separate banner."""
     _t, _m, _a, _motif, scene = resolve_scene(keyword or main, title, category)
-    return (
-        f'Korean news thumbnail, 16:9, cinematic {scene}, high contrast, '
-        f'dark translucent banner on lower third. '
-        f'Large bold white Korean headline clearly readable: "{main}". '
-        f'Smaller bold yellow Korean subheadline below it: "{sub}". '
-        f'No logos, no watermarks, no realistic celebrity face, no long paragraphs.'
-    )
+    return _IMAGE_PROMPT_TMPL.format(scene=scene, main=main, sub=sub)
 
 
 def _pick_font(size: int) -> ImageFont.ImageFont:
@@ -178,10 +224,16 @@ def _clamp_chars(text: str, target: int, hard_max: int | None = None) -> str:
     hard_max = hard_max or target + 4
     if len(text) <= hard_max:
         return text
-    return text[:target].rstrip()
+    truncated = text[:target].rstrip()
+    if " " in truncated:
+        cut = truncated.rsplit(" ", 1)[0].strip(" '\"'“‘")
+        if len(cut) >= max(4, target - 5):
+            return cut
+    return truncated
 
 
 def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple[str, str]:
+    """Main headline (8~14자) + sub headline (12~20자) for the image prompt."""
     title = (title or "").strip()
     keyword = (keyword or "").strip()
     head = title
@@ -211,14 +263,14 @@ def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple
             if tok in built:
                 continue
             trial = f"{built} {tok}".strip()
-            if len(trial) > 12:
+            if len(trial) > 14:
                 break
             built = trial
-            if len(re.findall(r"[가-힣A-Za-z0-9]", built)) >= 8:
+            if len(re.findall(r"[가-힣A-Za-z0-9]", built)) >= 11:
                 break
         main_src = built
-    main = _clamp_chars(main_src, target=8, hard_max=12)
-    main = re.sub(r"\s*무슨(\s*일이길래)?\??\s*$", "", main).strip() or main_src[:8]
+    main = _clamp_chars(main_src, target=11, hard_max=14)
+    main = re.sub(r"\s*무슨(\s*일이길래)?\??\s*$", "", main).strip() or main_src[:11]
 
     remainder = title
     for token in (main_src, keyword, head):
@@ -240,22 +292,136 @@ def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple
         remainder = remainder.replace(tok, " ")
     remainder = re.sub(r"\s+", " ", remainder).strip(" ,-·")
     fallback = {
-        "금융": "지갑 영향과 대응 포인트",
-        "투자": "투자자 영향과 대응 전략",
-        "건강": "건강 영향과 대응 수칙",
-        "생활안전": "안전 영향과 대피 요령",
-        "법률": "법적 영향과 대응 절차",
-    }.get(category, "핵심 이슈와 대응 정리")
+        "금융": "지갑에 미치는 영향과 대응 포인트",
+        "투자": "투자자 영향과 대응 전략 정리",
+        "건강": "건강에 미치는 영향과 대응 수칙",
+        "생활안전": "안전 영향과 대피 요령 정리",
+        "법률": "법적 영향과 대응 절차 정리",
+    }.get(category, "핵심 이슈와 대응 방법 정리")
     hangul_len = len(re.findall(r"[가-힣]", remainder))
-    if hangul_len >= 5 and len(remainder) >= 6:
-        sub = _clamp_chars(remainder, target=14, hard_max=18)
+    if hangul_len >= 6 and len(remainder) >= 8:
+        sub = _clamp_chars(remainder, target=16, hard_max=20)
     else:
-        sub = _clamp_chars(fallback, target=14, hard_max=18)
+        sub = _clamp_chars(fallback, target=16, hard_max=20)
     return main, sub
 
 
-def slugify(keyword: str) -> str:
-    slug = re.sub(r"[^0-9A-Za-z가-힣]+", "-", (keyword or "").strip()).strip("-")
+# ---- ASCII slug generation --------------------------------------------------
+
+# Korean/ASCII entity → ascii slug token. Longer keys are tried first so
+# compound phrases (e.g. "통합 국군") win over shorter overlapping ones.
+ENTITY_SLUG_MAP: list[tuple[str, str]] = [
+    ("삼성전자", "samsung-electronics"),
+    ("반도체", "semiconductor"),
+    ("하이닉스", "sk-hynix"),
+    ("웨이퍼", "wafer"),
+    ("키미", "kimi"),
+    ("인공지능", "ai"),
+    ("닛케이", "nikkei"),
+    ("평균주가", "average-price"),
+    ("증시", "stock-market"),
+    ("주가", "stock-price"),
+    ("코스피", "kospi"),
+    ("코스닥", "kosdaq"),
+    ("매수", "buy"),
+    ("매도", "sell"),
+    ("사이드카", "sidecar"),
+    ("관세", "tariffs"),
+    ("무역", "trade"),
+    ("수출", "exports"),
+    ("항구", "port"),
+    ("컨테이너", "container"),
+    ("중동", "middle-east"),
+    ("유가", "oil-price"),
+    ("원유", "crude-oil"),
+    ("이란", "iran"),
+    ("이스라엘", "israel"),
+    ("댐", "dam"),
+    ("호우", "heavy-rain"),
+    ("침수", "flooding"),
+    ("태풍", "typhoon"),
+    ("홍수", "flood"),
+    ("방류", "discharge"),
+    ("황강", "hwanggang"),
+    ("근저당", "mortgage-lien"),
+    ("부동산", "real-estate"),
+    ("전세", "jeonse"),
+    ("주택담보", "mortgage"),
+    ("주택", "housing"),
+    ("아파트", "apartment"),
+    ("미소금융", "microfinance"),
+    ("서민금융", "microfinance"),
+    ("지원금", "subsidy"),
+    ("보조금", "grant"),
+    ("통합 국군", "military-academy"),
+    ("국군사관", "military-academy"),
+    ("사관학교", "military-academy"),
+    ("육사", "military-academy"),
+    ("두산", "doosan"),
+    ("홈런", "home-run"),
+    ("연장", "extra-innings"),
+    ("우천", "rain-delay"),
+    ("야구", "baseball"),
+    ("월드컵", "world-cup"),
+    ("국가대표", "national-team"),
+    ("아르헨티나", "argentina"),
+    ("메시", "messi"),
+    ("은퇴", "retirement"),
+    ("축구", "football"),
+    ("냉장고", "refrigerator"),
+    ("김치", "kimchi"),
+    ("가전", "appliance"),
+    ("대출", "loan"),
+    ("세금", "tax"),
+    ("kt", "kt"),
+]
+
+
+def _find_entity_tokens(text: str, limit: int = 2) -> list[str]:
+    text = text.lower()
+    used_spans: list[tuple[int, int]] = []
+    matches: list[tuple[int, str]] = []
+    for key, token in sorted(ENTITY_SLUG_MAP, key=lambda kv: -len(kv[0])):
+        start = 0
+        while True:
+            idx = text.find(key, start)
+            if idx == -1:
+                break
+            span = (idx, idx + len(key))
+            overlaps = any(idx < e and s < span[1] for s, e in used_spans)
+            if not overlaps:
+                matches.append((idx, token))
+                used_spans.append(span)
+            start = idx + len(key)
+    matches.sort(key=lambda m: m[0])
+    tokens: list[str] = []
+    for _, tok in matches:
+        if tok not in tokens:
+            tokens.append(tok)
+        if len(tokens) >= limit:
+            break
+    return tokens
+
+
+def slugify(keyword: str, title: str = "") -> str:
+    """ASCII-only slug for filenames/URLs (never Korean characters).
+
+    Prefers known entity names translated/romanized to English
+    (e.g. 메시+아르헨티나 -> messi-argentina, 육사 -> military-academy,
+    두산 -> doosan). Falls back to any Latin/digit tokens already present
+    in the text, and finally to a short content hash so the slug is always
+    ASCII and stable for the same topic.
+    """
+    combined = f"{keyword or ''} {title or ''}".strip()
+    tokens = _find_entity_tokens(combined, limit=2)
+    if not tokens:
+        latin = re.findall(r"[A-Za-z0-9]{2,}", keyword or "") or re.findall(r"[A-Za-z0-9]{2,}", title or "")
+        tokens = [t.lower() for t in latin[:2]]
+    if not tokens:
+        digest = hashlib.md5(combined.encode("utf-8")).hexdigest()[:8]
+        tokens = [f"topic-{digest}"]
+    slug = "-".join(tokens)
+    slug = re.sub(r"[^0-9a-z-]+", "-", slug).strip("-")
     return (slug[:48] or "topic").lower()
 
 
@@ -295,7 +461,7 @@ def _motif_chip(draw: ImageDraw.ImageDraw, w: int, h: int, accent: tuple[int, in
     for _ in range(40):
         x1, y1 = rng.randint(cx - 120, cx + 120), rng.randint(cy - 120, cy + 120)
         x2, y2 = x1 + rng.choice([-1, 1]) * rng.randint(20, 80), y1 + rng.choice([-1, 0, 1]) * rng.randint(0, 40)
-        draw.line([(x1, y1), (x2, y2)], fill=(*accent, 180) if False else accent, width=1)
+        draw.line([(x1, y1), (x2, y2)], fill=accent, width=1)
 
 
 def _motif_ai(img: Image.Image, accent: tuple[int, int, int], rng: random.Random) -> Image.Image:
@@ -314,12 +480,10 @@ def _motif_ai(img: Image.Image, accent: tuple[int, int, int], rng: random.Random
 
 
 def _motif_port(draw: ImageDraw.ImageDraw, w: int, h: int, accent: tuple[int, int, int], rng: random.Random) -> None:
-    # Cranes
     for cx in (int(w * 0.55), int(w * 0.75), int(w * 0.9)):
         draw.line([(cx, 40), (cx, int(h * 0.55))], fill=accent, width=4)
         draw.line([(cx - 80, 80), (cx + 100, 80)], fill=accent, width=4)
         draw.line([(cx + 100, 80), (cx + 100, 140)], fill=accent, width=3)
-    # Containers
     y = int(h * 0.42)
     x = int(w * 0.45)
     colors = [accent, (200, 80, 60), (60, 120, 180), (220, 160, 40)]
@@ -330,7 +494,6 @@ def _motif_port(draw: ImageDraw.ImageDraw, w: int, h: int, accent: tuple[int, in
 
 
 def _motif_water(draw: ImageDraw.ImageDraw, w: int, h: int, accent: tuple[int, int, int], rng: random.Random) -> None:
-    # Dam wall
     draw.polygon([(int(w * 0.35), 60), (int(w * 0.7), 60), (int(w * 0.85), int(h * 0.55)), (int(w * 0.2), int(h * 0.55))], outline=accent, width=3)
     for i in range(8):
         x = int(w * 0.4) + i * 30
@@ -373,7 +536,6 @@ def _motif_academy(draw: ImageDraw.ImageDraw, w: int, h: int, accent: tuple[int,
         x = int(w * 0.5) + i * 50
         draw.rectangle([x, 110, x + 30, base - 10], outline=accent, width=2)
     draw.polygon([(int(w * 0.45), 80), (int(w * 0.675), 40), (int(w * 0.9), 80)], outline=accent, width=3)
-    # Flag poles
     for x in (int(w * 0.5), int(w * 0.65), int(w * 0.8)):
         draw.line([(x, 40), (x, 100)], fill=accent, width=3)
 
@@ -383,7 +545,6 @@ def _motif_finance(draw: ImageDraw.ImageDraw, w: int, h: int, accent: tuple[int,
         r = 28 + (i % 3) * 6
         y = int(h * 0.35) + (i % 4) * 20
         draw.ellipse([x - r, y - r, x + r, y + r], outline=accent, width=3)
-        draw.text((x - 8, y - 12), "₩", fill=accent)  # may fallback if font missing - decorative
 
 
 def paint_topic_background(
@@ -400,7 +561,6 @@ def paint_topic_background(
     img = _gradient_base(width, height, top, mid)
     draw = ImageDraw.Draw(img)
 
-    # Soft vignette / light bloom unique per seed.
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
     for _ in range(3):
@@ -433,7 +593,6 @@ def paint_topic_background(
     elif motif == "finance":
         _motif_finance(draw, width, height, accent, rng)
     else:
-        # Abstract news bars unique per seed
         for i in range(5):
             x0 = rng.randint(-40, width // 2)
             od2 = ImageDraw.Draw(img)
@@ -442,28 +601,21 @@ def paint_topic_background(
                 fill=tuple(min(255, c + 20) for c in mid),
             )
 
-    # Slight blur + contrast for broadcast feel.
     img = img.filter(ImageFilter.GaussianBlur(radius=0.6))
     img = ImageEnhance.Contrast(img).enhance(1.15)
     return img
 
 
-def load_ai_background(slug: str, width: int = 1280, height: int = 720) -> Image.Image | None:
-    """Load a pre-generated AI plate from posts/images/bg-{slug}.* if present."""
+def _find_source(directory: Path, stem: str) -> Path | None:
     for ext in (".jpg", ".jpeg", ".png", ".webp"):
-        path = IMAGE_DIR / f"bg-{slug}{ext}"
+        path = directory / f"{stem}{ext}"
         if path.exists():
-            im = Image.open(path).convert("RGB")
-            im = ImageOps.fit(im, (width, height), method=Image.Resampling.LANCZOS)
-            # Darken lower third a bit so the banner type stays readable.
-            overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-            od = ImageDraw.Draw(overlay)
-            od.rectangle([0, int(height * 0.55), width, height], fill=(0, 0, 0, 60))
-            return Image.alpha_composite(im.convert("RGBA"), overlay).convert("RGB")
+            return path
     return None
 
 
 def _draw_watermark(img: Image.Image) -> None:
+    """Small translucent "@욘두두" label only - never a full-width banner."""
     draw = ImageDraw.Draw(img, "RGBA")
     font = _pick_font(28)
     text = "@욘두두"
@@ -476,48 +628,80 @@ def _draw_watermark(img: Image.Image) -> None:
     draw.text((box[0] + pad_x, box[1] + pad_y - 1), text, font=font, fill=(255, 255, 255, 235))
 
 
-def compose_news_thumbnail(
+def render_headline_on_image(
+    img: Image.Image,
+    main: str,
+    sub: str,
+    accent: tuple[int, int, int],
+) -> Image.Image:
+    """Bake the Korean headline directly onto the scene using thick stroke
+    outlines (no rectangle/banner underneath) so the background stays fully
+    visible, matching a broadcast title-card look.
+    """
+    img = img.convert("RGB")
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+
+    main_size = int(h * 0.135)
+    main_font = _pick_font(main_size)
+    max_w = w - 88
+    while draw.textlength(main, font=main_font) > max_w and main_size > 40:
+        main_size -= 4
+        main_font = _pick_font(main_size)
+    main_stroke = max(4, main_size // 13)
+
+    sub_size = max(26, int(main_size * 0.46))
+    sub_font = _pick_font(sub_size)
+    while draw.textlength(sub, font=sub_font) > max_w and sub_size > 24:
+        sub_size -= 2
+        sub_font = _pick_font(sub_size)
+    sub_stroke = max(3, sub_size // 11)
+
+    main_metrics = main_font.getmetrics()
+    sub_metrics = sub_font.getmetrics()
+    block_h = main_metrics[0] + main_metrics[1] + 12 + sub_metrics[0] + sub_metrics[1]
+    main_x = 44
+    main_y = h - block_h - 44
+    sub_y = main_y + main_metrics[0] + main_metrics[1] + 12
+
+    draw.text(
+        (main_x, main_y), main, font=main_font,
+        fill=(255, 255, 255, 255), stroke_width=main_stroke, stroke_fill=(0, 0, 0, 255),
+    )
+    draw.text(
+        (main_x, sub_y), sub, font=sub_font,
+        fill=(*accent, 255), stroke_width=sub_stroke, stroke_fill=(0, 0, 0, 255),
+    )
+    return img
+
+
+def compose_pillow_headline(
     background: Image.Image,
     main: str,
     sub: str,
     accent: tuple[int, int, int],
     out_path: Path,
 ) -> Path:
-    """Overlay lower-third banner + Korean type + required watermark onto a plate."""
+    """Overlay baked-in Korean headline + required watermark onto a plate.
+    No lower-third bar/gradient - the topic background stays fully visible.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    img = background.convert("RGBA")
-    width, height = img.size
-    draw = ImageDraw.Draw(img)
-
-    # Soft gradient lower-third (not a hard black slab) so topic plates stay visible.
-    banner_top = int(height * 0.58)
-    for y in range(banner_top, height):
-        t = (y - banner_top) / max(1, height - banner_top)
-        alpha = int(90 + 110 * t)  # 90 → 200
-        draw.line([(0, y), (width, y)], fill=(0, 0, 0, alpha))
-    draw.rectangle([0, banner_top, width, banner_top + 4], fill=(*accent, 230))
-
-    main_size = 78
-    main_font = _pick_font(main_size)
-    while draw.textlength(main, font=main_font) > width - 80 and main_size > 44:
-        main_size -= 4
-        main_font = _pick_font(main_size)
-    main_x, main_y = 40, banner_top + 28
-    draw.text((main_x + 3, main_y + 3), main, font=main_font, fill=(0, 0, 0, 180))
-    draw.text((main_x, main_y), main, font=main_font, fill=(255, 255, 255, 255))
-
-    sub_size = 40
-    sub_font = _pick_font(sub_size)
-    while draw.textlength(sub, font=sub_font) > width - 80 and sub_size > 28:
-        sub_size -= 2
-        sub_font = _pick_font(sub_size)
-    sub_y = main_y + main_font.getmetrics()[0] + main_font.getmetrics()[1] + 10
-    draw.text((main_x + 2, sub_y + 2), sub, font=sub_font, fill=(0, 0, 0, 160))
-    draw.text((main_x, sub_y), sub, font=sub_font, fill=(*accent, 255))
-
+    img = render_headline_on_image(background, main, sub, accent).convert("RGBA")
     _draw_watermark(img)
-    rgb = img.convert("RGB")
-    rgb.save(out_path, format="JPEG", quality=88, optimize=True)
+    img.convert("RGB").save(out_path, format="JPEG", quality=88, optimize=True)
+    return out_path
+
+
+def finalize_full_ai_thumbnail(src_path: Path, out_path: Path, width: int = 1280, height: int = 720) -> Path:
+    """Take an AI-generated plate that already has the Korean headline baked
+    in (per `build_image_prompt`) and just resize + add the watermark.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    im = Image.open(src_path).convert("RGB")
+    im = ImageOps.fit(im, (width, height), method=Image.Resampling.LANCZOS)
+    im = im.convert("RGBA")
+    _draw_watermark(im)
+    im.convert("RGB").save(out_path, format="JPEG", quality=90, optimize=True)
     return out_path
 
 
@@ -533,17 +717,25 @@ def generate_news_thumbnail(
     keyword = keyword or main
     title = title or main
     top, mid, accent, motif, scene = resolve_scene(keyword, title, category)
-    slug = slugify(keyword)
+    slug = slugify(keyword, title)
     _log(f"scene[{motif}]: {scene}")
     _log(f"prompt: {build_image_prompt(main, sub, category, keyword=keyword, title=title)}")
 
-    bg = load_ai_background(slug)
-    if bg is None:
-        bg = paint_topic_background(keyword, title, category, seed=seed or f"{motif}:{slug}")
-    else:
-        _log(f"using AI background plate bg-{slug}.*")
+    full_ai = _find_source(GENERATED_DIR, f"ai-thumb-{slug}")
+    if full_ai:
+        _log(f"using full AI thumbnail ai-thumb-{slug}.* (headline baked in)")
+        return finalize_full_ai_thumbnail(full_ai, out_path)
 
-    return compose_news_thumbnail(bg, main, sub, accent, out_path)
+    bg_plate = _find_source(GENERATED_DIR, f"bg-{slug}")
+    if bg_plate:
+        _log(f"using AI background plate bg-{slug}.* + direct headline overlay")
+        im = Image.open(bg_plate).convert("RGB")
+        im = ImageOps.fit(im, (1280, 720), method=Image.Resampling.LANCZOS)
+    else:
+        _log("no AI plate found - using varied Pillow fallback scene")
+        im = paint_topic_background(keyword, title, category, seed=seed or f"{motif}:{slug}")
+
+    return compose_pillow_headline(im, main, sub, accent, out_path)
 
 
 def _run_git(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -556,15 +748,15 @@ def _run_git(args: list[str], check: bool = True) -> subprocess.CompletedProcess
     )
 
 
+def _last_commit_sha_for(path: Path) -> str | None:
+    res = _run_git(["log", "-n", "1", "--format=%H", "--", path.as_posix()], check=False)
+    sha = res.stdout.strip()
+    return sha or None
+
+
 def commit_and_push_thumb(image_path: Path, main: str) -> str:
     rel = image_path.as_posix()
     _run_git(["add", "--", rel])
-    # Also add paired AI background plate if present.
-    slug = image_path.stem.replace("thumb-", "", 1)
-    for ext in (".jpg", ".jpeg", ".png", ".webp"):
-        bg = IMAGE_DIR / f"bg-{slug}{ext}"
-        if bg.exists():
-            _run_git(["add", "--", bg.as_posix()])
     status = _run_git(["status", "--porcelain", "--", "posts/images"], check=False)
     if not status.stdout.strip():
         return _run_git(["rev-parse", "HEAD"]).stdout.strip()
@@ -626,11 +818,32 @@ def build_thumb_for_post(
     keyword: str,
     category: str,
     push: bool = True,
+    force: bool = False,
 ) -> tuple[str, str, str]:
+    """Build (or reuse) the ASCII-named thumbnail for a post.
+
+    - If the thumbnail file already exists, it is kept as-is unless
+      `force=True` is passed explicitly.
+    - Slugs in `PROTECTED_SLUGS` are never regenerated, even with
+      `force=True`.
+    """
     main, sub = make_thumb_texts(title, keyword=keyword, category=category)
-    slug = slugify(keyword or main)
+    slug = slugify(keyword or main, title)
     filename = f"thumb-{slug}.jpg"
     out_path = IMAGE_DIR / filename
+
+    if out_path.exists():
+        if slug in PROTECTED_SLUGS:
+            _log(f"protected thumbnail, keeping as-is: {filename}")
+        elif not force:
+            _log(f"thumbnail already exists, keeping current file: {filename}")
+        else:
+            out_path = None  # type: ignore[assignment]
+        if out_path is not None:
+            sha = _last_commit_sha_for(IMAGE_DIR / filename) or _run_git(["rev-parse", "HEAD"]).stdout.strip()
+            return jsdelivr_url(sha, filename), main, sub
+        out_path = IMAGE_DIR / filename
+
     generate_news_thumbnail(
         main, sub, category, out_path, keyword=keyword or main, title=title, seed=f"{category}:{slug}"
     )

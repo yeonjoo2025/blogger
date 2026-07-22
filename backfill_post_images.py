@@ -97,6 +97,7 @@ def main() -> None:
                 keyword=keyword,
                 category=category,
                 push=True,
+                force=REPLACE_EXISTING,
             )
             print(f"  texts: main={main!r} sub={sub!r}", flush=True)
             new_content = inject_thumb_html(
