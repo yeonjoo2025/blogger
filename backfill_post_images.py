@@ -18,6 +18,9 @@ from keyword_filter import classify
 from post_images import build_and_host_hero, content_has_image, inject_hero_image
 from trend_sources import NewsRef
 
+# Re-run mode: replace existing heroes (used when regenerating thumbnail style).
+REPLACE_EXISTING = "--replace" in sys.argv
+
 
 def _guess_category(title: str) -> str:
     category, include_hits, _exclude = classify(title, [NewsRef(title=title)])
@@ -42,10 +45,15 @@ def _keyword_from_title(title: str) -> str:
     # Prefer the phrase before the first topical separator used by our
     # pipeline titles. Use ", " (comma+space) rather than bare "," so that
     # amounts like "(2,000억원)" are not truncated mid-parenthesis.
+    head = title
     for sep in (", ", " - ", "…", "...", "？", "?"):
-        if sep in title:
-            return title.split(sep, 1)[0].strip()
-    return title.strip()[:40]
+        if sep in head:
+            head = head.split(sep, 1)[0].strip()
+            break
+    # Drop trailing parenthetical angle crumbs like "(3개월)" / "(2,000억원)"
+    # so the card-news title stays punchy.
+    head = re.sub(r"\s*[\(（][^\)）]{0,24}[\)）]\s*$", "", head).strip()
+    return head[:40] or title.strip()[:40]
 
 
 def main() -> None:
@@ -59,11 +67,18 @@ def main() -> None:
     while request is not None:
         response = request.execute()
         for post in response.get("items") or []:
-            if not content_has_image(post.get("content") or ""):
+            content = post.get("content") or ""
+            if REPLACE_EXISTING:
+                # Only touch posts that already carry our generated hero, so we
+                # don't overwrite manually curated images on older posts.
+                if 'class="post-hero"' in content or "post-hero" in content:
+                    targets.append(post)
+            elif not content_has_image(content):
                 targets.append(post)
         request = service.posts().list_next(request, response)
 
-    print(f"[backfill_post_images] {len(targets)} LIVE post(s) without images", flush=True)
+    mode = "replace card-news thumbnails on" if REPLACE_EXISTING else "add images to"
+    print(f"[backfill_post_images] {mode} {len(targets)} LIVE post(s)", flush=True)
     updated = 0
     for idx, post in enumerate(targets, start=1):
         post_id = post["id"]
@@ -73,7 +88,12 @@ def main() -> None:
         print(f"[{idx}/{len(targets)}] {title!r} -> keyword={keyword!r} category={category}", flush=True)
         try:
             url = build_and_host_hero(creds, keyword, category)
-            new_content = inject_hero_image(post.get("content") or "", url, alt=keyword)
+            new_content = inject_hero_image(
+                post.get("content") or "",
+                url,
+                alt=keyword,
+                replace_existing=REPLACE_EXISTING,
+            )
             service.posts().patch(
                 blogId=blog_id,
                 postId=post_id,
