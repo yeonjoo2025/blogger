@@ -1,20 +1,54 @@
 # blogger
 
-트렌드 키워드 기반 Blogger 자동 포스팅용 저장소입니다.
+트렌드 키워드 기반 Blogger 정보성 포스팅용 저장소입니다.
 
 ## 로컬 설정
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install google-auth-oauthlib google-auth-httplib2 google-api-python-client
+pip install google-auth-oauthlib google-auth-httplib2 google-api-python-client requests
 python get_token.py      # OAuth 토큰 1회 발급 → token.json 생성
 python publish_test.py   # 테스트 발행
 python read_recent_posts.py --limit 6
 python format_latest_post_for_slack.py
+python publish_trend.py  # 트렌드 수집 → 필터링 → 정보성 글 발행
 ```
 
-`client_secret.json`, `token.json`은 Git에 올리지 마세요.
+## publish_trend.py
+
+가장 이슈가 큰 정보성 키워드(금융·법률·건강·생활안전·투자 등, 실행당 최대 1개, 기본값)만 골라
+"이슈 / 영향 / 확인 방법 / 대응 방법 / 관련 소식" 구조의 글을 작성·발행합니다.
+
+- `trend_sources.py`: Google Trends KR RSS, loword.co.kr 실시간 검색어(헤드리스 크롬 렌더링),
+  blackkiwi.net 트렌드 JSON API(`/api/service/keyword/issue-keywords`, `new-keywords`)에서
+  1h/4h/24h 창으로 키워드를 수집하고, Google News RSS로 각 키워드의 실제 보도를 가져옵니다.
+- `keyword_filter.py`: 연예·스포츠·단순 인명 이슈를 제외하고, 실제 보도 내용을 근거로
+  금융/투자/건강/생활안전/법률 카테고리 여부와 "한 사건에 대한 보도인지(헤드라인 응집도)"를 판단합니다.
+- `content_writer.py`: 실제 뉴스 헤드라인을 근거로 5단 구조의 본문과 제목을 생성합니다.
+- `publish_trend.py`: 위 과정을 조율하고 Blogger에 발행합니다. 신규 발행 한도가 막히면
+  (또는 403/429) 그날은 더 이상 글을 생성·수정하지 않고 종료합니다. 애매한 키워드는 억지로 쓰지 않고 건너뜁니다.
+
+### 발행 개수 조절 (편집 정책 vs API 할당량)
+
+두 개의 서로 다른 개념을 분리해서 관리합니다.
+
+- **`BLOGGER_MAX_POSTS_PER_RUN` (기본값 1)**: 한 번 실행할 때 작성할 주제 개수(편집 정책).
+  이 자동화는 4시간마다(하루 6회) 실행되므로 기본값 1이면 하루 최대 6개 글을 쓰게 되어,
+  "가장 이슈가 되는 것만, 애매하면 줄인다"는 원칙과 잘 맞습니다. API 할당량과는 무관하게
+  콘텐츠 품질 기준으로 정하는 값입니다.
+- **`BLOGGER_MAX_NEW_POSTS_PER_DAY` (기본값 50)**: Blogger API의 "신규 글 발행"에 대해
+  통상적으로 알려진(공식 문서화는 아니지만 다년간 다수 개발자가 공통적으로 보고한) 하루 상한
+  추정치입니다. 다만 신생 블로그·신생 앱은 이보다 훨씬 낮은 한도(예: 6개)에서 막히는 경우가
+  흔합니다. 이 값은 상한선 추정치로만 쓰이고, 실제로 403/429를 받거나 오늘 발행 수가 한도에
+  도달하면 **그날은 신규 생성·기존 글 업데이트를 모두 중단**하고 다음 주기로 넘깁니다. 한도
+  소진 여부는 `.blogger_quota_state.json`(Git에 커밋하지 않음)에 KST 날짜 기준으로 기록되어,
+  같은 날 재실행 시 불필요한 재시도를 막아 줍니다.
+
+Cloud Agent 자동화에서는 `BLOGGER_CLIENT_SECRET` / `BLOGGER_TOKEN` 환경변수(시크릿)로부터
+`client_secret.json` / `token.json`을 만든 뒤 실행합니다.
+
+`client_secret.json`, `token.json`, `.blogger_quota_state.json`은 Git에 올리지 마세요.
 
 ## Cloud Agent 시크릿 (필수)
 
@@ -26,14 +60,14 @@ python format_latest_post_for_slack.py
 
 | Name | Value |
 |------|--------|
-| `BLOGGER_TOKEN_JSON` | 로컬 `token.json` **전체 JSON 내용** |
+| `BLOGGER_TOKEN` | 로컬 `token.json` **전체 JSON 내용** |
 
 선택:
 
 | Name | Value |
 |------|--------|
-| `BLOGGER_CLIENT_SECRET_JSON` | `client_secret.json` 전체 JSON |
+| `BLOGGER_CLIENT_SECRET` | `client_secret.json` 전체 JSON |
 
-스크립트는 `token.json`이 없으면 `BLOGGER_TOKEN_JSON`에서 파일을 만듭니다.
+스크립트는 `token.json`이 없으면 `BLOGGER_TOKEN`(또는 `BLOGGER_TOKEN_JSON`)에서 파일을 만듭니다.
 
 시크릿 등록 후 자동화를 **새로 Run** 하세요 (이미 떠 있던 run에는 시크릿이 안 들어갈 수 있습니다).
