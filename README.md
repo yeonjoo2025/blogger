@@ -50,6 +50,20 @@ Cloud Agent 자동화에서는 `BLOGGER_CLIENT_SECRET` / `BLOGGER_TOKEN` 환경�
 
 `client_secret.json`, `token.json`, `.blogger_quota_state.json`은 Git에 올리지 마세요.
 
+### 수동 게시 대체 경로 (`pending_posts/`)
+
+Blogger 계정이 "원치 않는 콘텐츠 전송" 등의 이유로 API 쓰기(`posts.insert`)가
+차단되면(403이 계속 발생), 신규 발행/기존 글 수정은 전혀 시도하지 않지만 그렇다고
+이미 모든 검증을 통과한 주제의 콘텐츠를 버리지는 않습니다. 대신 제목+본문을
+`pending_posts/타임스탬프_키워드.html` 파일로 저장합니다.
+
+- 이 폴더는 Git에 커밋됩니다 - 리포지토리/PR에서 바로 확인할 수 있습니다.
+- 파일을 열어 제목과 본문을 그대로 Blogger 웹 UI에 복사해 수동으로 게시하면 됩니다.
+- 다음 실행 시 해당 키워드가 실제 라이브 글로 확인되면 그 pending 파일은 자동으로
+  삭제됩니다(수동 게시 여부를 읽기 전용 `posts.list` API로 계속 확인하기 때문에,
+  쓰기 API가 막혀 있어도 이 감지는 정상 동작합니다).
+- API 쓰기가 다시 정상화되면 별도 설정 변경 없이 자동으로 API 발행으로 복귀합니다.
+
 ## Cloud Agent 시크릿 (필수)
 
 자동화/Cloud Agent는 저장소에 `token.json`이 없습니다. 아래를 등록하세요.

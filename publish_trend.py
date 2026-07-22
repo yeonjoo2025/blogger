@@ -1,6 +1,7 @@
 """Collect KR trending keywords, keep only high-impact informational topics,
-and publish (or, if new posts are blocked, update an old post with) a
-structured Blogger article for each one.
+and publish a structured Blogger article for each one - or, if the
+Blogger write API is unavailable, save it under pending_posts/ for a human
+to post by hand instead.
 
 Pipeline:
   1. Collect keyword candidates from Google Trends KR, loword.co.kr and
@@ -27,8 +28,18 @@ Pipeline:
      (default 50, override with BLOGGER_MAX_NEW_POSTS_PER_DAY) as an upper
      bound to skip an obviously-doomed insert call. The moment Blogger
      returns 403/429 (or the assumed quota is already exhausted), this run
-     stops publishing entirely - no new posts and no updates of old posts -
-     and waits for the next cron cycle when quota may have reset.
+     stops calling the write API entirely for the rest of today - no new
+     posts and no updates of old posts.
+  6. Manual-posting fallback: a 403/429 (or Google's account-wide "Blogger
+     used to send unwanted content" API restriction, which manifests as a
+     persistent 403 on every insert regardless of isDraft) does not mean
+     the *content* is lost. Whenever the API write is skipped or fails for
+     a topic that already passed every quality gate above, its title+body
+     is saved as an HTML file under pending_posts/ so a human can copy it
+     into the Blogger web UI by hand until the restriction is lifted. Once
+     a pending topic shows up as a live post (detected via the read-only
+     posts.list API, which keeps working even while insert is blocked),
+     its pending_posts/ file is automatically deleted on the next run.
 
 Run: python3 publish_trend.py
 """
@@ -37,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -62,6 +74,7 @@ DEDUPE_LOOKBACK_HOURS = 20
 NEWS_PER_CANDIDATE = 15
 NEWS_SHOWN_IN_POST = 6
 QUOTA_STATE_PATH = Path(".blogger_quota_state.json")
+PENDING_DIR = Path("pending_posts")
 
 # Editorial cap: how many topics we're willing to write about per run. This
 # is a *content quality* decision ("가장 이슈가 되는 것만 작성, 애매하면
@@ -318,6 +331,69 @@ def publish_new_post(service, blog_id: str, title: str, content: str) -> dict:
     return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
 
 
+def _slugify(keyword: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z가-힣]+", "-", keyword).strip("-")
+    return slug[:40] or "topic"
+
+
+def save_pending_draft(now: datetime, topic: TopicCandidate, title: str, content: str, reason: str) -> Path:
+    """Save a fully-qualified topic's title+body for manual copy/paste
+    publishing, used whenever the Blogger write API is blocked or fails.
+    The keyword is embedded as an HTML comment so a later run can detect,
+    via the read-only list API, once a human has manually published it.
+    """
+    PENDING_DIR.mkdir(exist_ok=True)
+    stamp = now.astimezone(KST).strftime("%Y%m%d-%H%M%S")
+    path = PENDING_DIR / f"{stamp}_{_slugify(topic.keyword)}.html"
+    header = (
+        f"<!-- keyword: {topic.keyword} -->\n"
+        f"<!-- category: {topic.category} -->\n"
+        f"<!-- generated_at_kst: {now.astimezone(KST).isoformat()} -->\n"
+        f"<!-- reason: {reason} -->\n"
+        f"<!-- 사용법: 아래 제목/본문을 Blogger 웹 UI에 그대로 복사해 수동으로 게시하세요.\n"
+        f"     다음 실행 시 이 글이 라이브로 확인되면 이 파일은 자동으로 삭제됩니다. -->\n"
+    )
+    path.write_text(header + f"<h1>{title}</h1>\n" + content, encoding="utf-8")
+    return path
+
+
+_PENDING_KEYWORD_RE = re.compile(r"<!--\s*keyword:\s*(.*?)\s*-->")
+
+
+def _pending_draft_keyword(path: Path) -> str | None:
+    try:
+        head = path.read_text(encoding="utf-8")[:500]
+    except OSError:
+        return None
+    match = _PENDING_KEYWORD_RE.search(head)
+    return match.group(1) if match else None
+
+
+def _keyword_is_now_live(keyword: str, recent_posts: list[dict]) -> bool:
+    norm_kw = normalize_keyword(keyword)
+    if not norm_kw:
+        return False
+    for post in recent_posts:
+        title = post.get("title", "")
+        if norm_kw in normalize_keyword(title) or is_near_duplicate(keyword, title):
+            return True
+    return False
+
+
+def cleanup_resolved_pending_drafts(recent_posts: list[dict]) -> int:
+    """Delete pending_posts/ files whose topic is already live on the blog
+    (i.e. a human copied the draft in and published it by hand)."""
+    if not PENDING_DIR.exists():
+        return 0
+    removed = 0
+    for path in sorted(PENDING_DIR.glob("*.html")):
+        keyword = _pending_draft_keyword(path)
+        if keyword and _keyword_is_now_live(keyword, recent_posts):
+            path.unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
 def main() -> None:
     now = datetime.now(timezone.utc)
 
@@ -335,22 +411,29 @@ def main() -> None:
     recent_posts = list_all_live_posts(service, blog_id)
     log(f"fetched {len(recent_posts)} existing live posts for dedupe")
 
+    cleaned = cleanup_resolved_pending_drafts(recent_posts)
+    if cleaned:
+        log(f"removed {cleaned} pending_posts/ draft(s) now confirmed live (published manually)")
+
     new_posts_today = count_new_posts_today(recent_posts, now)
     remaining_quota = max(0, MAX_NEW_POSTS_PER_DAY - new_posts_today)
-    log(
-        f"new posts published today (KST): {new_posts_today}/{MAX_NEW_POSTS_PER_DAY} "
-        f"-> {remaining_quota} new-post slot(s) left for this run"
-    )
-    if remaining_quota <= 0 or load_quota_exhausted_today(now):
-        if remaining_quota > 0:
-            log(
-                "a previous run already hit today's new-post quota (403/429) - "
-                "stopping without creating or updating posts"
-            )
-        else:
-            log("daily new-post quota already used up - stopping without creating or updating posts")
-        return
+    api_blocked = remaining_quota <= 0 or load_quota_exhausted_today(now)
+    if api_blocked:
+        log(
+            "API insert looks blocked today (daily quota used up, or a previous run already "
+            "hit 403/429) - will still draft the best qualifying topic under pending_posts/ "
+            "for manual posting, without calling the write API again"
+        )
+    else:
+        log(
+            f"new posts published today (KST): {new_posts_today}/{MAX_NEW_POSTS_PER_DAY} "
+            f"-> {remaining_quota} new-post slot(s) left for this run"
+        )
 
+    # Even when the write API is known-blocked, we still run the full
+    # discovery/filtering pipeline below: the point of pending_posts/ is to
+    # make sure a genuinely qualified topic's content is never lost just
+    # because Blogger's API happens to be unavailable this cycle.
     candidates = build_candidates(now)
     log(f"{len(candidates)} candidates qualified after news-grounded filtering")
 
@@ -360,14 +443,18 @@ def main() -> None:
         return
 
     published_count = 0
+    drafted_count = 0
     for idx, topic in enumerate(final_topics, start=1):
-        if remaining_quota <= 0:
-            log("daily new-post quota used up mid-run - stopping without further create/update")
-            break
-
         title = build_title(topic.keyword, topic.category)
         content = build_body_html(topic.keyword, topic.category, topic.news)
         log(f"[{idx}/{len(final_topics)}] '{title}' (category={topic.category})")
+
+        if api_blocked or remaining_quota <= 0:
+            reason = "api_already_blocked_today" if api_blocked else "quota_used_up_mid_run"
+            path = save_pending_draft(now, topic, title, content, reason)
+            log(f"  write API unavailable - saved draft for manual posting: {path}")
+            drafted_count += 1
+            continue
 
         try:
             post = publish_new_post(service, blog_id, title, content)
@@ -379,17 +466,23 @@ def main() -> None:
             status = getattr(exc.resp, "status", None)
             if status in (403, 429):
                 mark_quota_exhausted_today(now, new_posts_today)
+                api_blocked = True
+                path = save_pending_draft(now, topic, title, content, f"http_{status}")
                 log(
-                    f"  new post blocked (HTTP {status}); marking today's quota exhausted "
-                    f"and stopping without creating or updating further posts"
+                    f"  new post blocked (HTTP {status}); marking today's quota exhausted, "
+                    f"saved draft for manual posting: {path}"
                 )
-                break
+                continue
             log(f"  publish failed (HTTP {status}), skipping this topic")
+            continue
 
-        if idx < len(final_topics) and remaining_quota > 0:
+        if idx < len(final_topics):
             time.sleep(2)
 
-    log(f"run finished - published {published_count} new post(s)")
+    log(
+        f"run finished - published {published_count} new post(s), "
+        f"drafted {drafted_count} pending post(s) for manual posting"
+    )
 
 
 if __name__ == "__main__":
