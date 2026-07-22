@@ -353,42 +353,99 @@ def count_new_posts_today(recent_posts: list[dict], now: datetime) -> int:
     return count
 
 
-def build_labels(keyword: str, category: str) -> list[str]:
-    """Blogger labels: category + 1~3 concise keyword tags.
+TARGET_LABEL_COUNT = 20
+MAX_LABEL_COUNT = 20
+_LABEL_SKIP = {
+    "무슨", "일이길래", "정리", "확인", "대응", "방법", "영향", "있나",
+    "이슈", "관련", "오늘", "내일", "실시간", "단독", "속보", "종합",
+    "사진", "영상", "기자", "뉴스", "기사", "포인트", "체크리스트",
+    "전망", "분석", "리뷰", "프리뷰", "마감", "특징주",
+}
+_CATEGORY_EXTRA_LABELS: dict[str, list[str]] = {
+    "금융": ["금리", "대출", "세금", "가계", "경제", "재테크", "물가", "환율", "은행", "보험"],
+    "투자": ["주식", "증시", "포트폴리오", "ETF", "실적", "공시", "나스닥", "코스피", "반도체", "시장"],
+    "건강": ["의료", "질병", "예방", "건강보험", "병원", "백신", "리콜", "증상", "식약처", "건강정보"],
+    "생활안전": ["재난", "안전", "대피", "기상특보", "침수", "화재", "정전", "안전수칙", "재난문자", "지역안전"],
+    "법률": ["규제", "소송", "판결", "법령", "과징금", "계약", "권리", "절차", "고발", "시행"],
+}
+_EARNINGS_EXTRA_LABELS = [
+    "실적발표", "어닝스", "분기실적", "컨센서스", "가이던스", "EPS",
+    "매출", "영업이익", "빅테크", "클라우드", "AI", "알파벳", "IR", "공시",
+]
 
-    Avoids long sentence-like tags and entertainment/gossip noise. Keeps
-    order stable: category first, then distinctive keyword tokens.
+
+def _add_label(labels: list[str], seen: set[str], candidate: str) -> None:
+    clean = re.sub(r"\s+", " ", (candidate or "").strip())
+    if not clean or len(clean) < 2 or len(clean) > 24:
+        return
+    if clean in _LABEL_SKIP:
+        return
+    key = clean.lower()
+    if key in seen:
+        return
+    seen.add(key)
+    labels.append(clean)
+
+
+def build_labels(
+    keyword: str,
+    category: str,
+    news: list | None = None,
+    target: int = TARGET_LABEL_COUNT,
+) -> list[str]:
+    """Blogger labels: about `target` concise tags (default ~20).
+
+    Order: category → full keyword → keyword tokens → news tokens →
+    topic/category extras. Skips long sentence-like or gossip noise tags.
     """
     labels: list[str] = []
-    cat = (category or "").strip()
-    if cat:
-        labels.append(cat)
+    seen: set[str] = set()
+    target = max(1, min(int(target or TARGET_LABEL_COUNT), MAX_LABEL_COUNT))
 
-    # Split keyword into short tokens; prefer multi-char hangul/latin chunks.
-    raw_tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", keyword or "")
-    skip = {
-        "무슨", "일이길래", "정리", "확인", "대응", "방법", "영향", "있나",
-        "이슈", "관련", "오늘", "내일", "실시간",
-    }
-    for tok in raw_tokens:
-        clean = tok.strip()
-        if not clean or clean in skip or clean in labels:
-            continue
-        # Drop pure noise like single-letter tickers already covered elsewhere.
-        if len(clean) > 20:
-            continue
-        labels.append(clean)
-        if len(labels) >= 4:  # category + up to 3 keyword tags
+    _add_label(labels, seen, (category or "").strip())
+
+    kw = (keyword or "").strip()
+    if kw and len(kw) <= 24:
+        _add_label(labels, seen, kw)
+    for tok in re.findall(r"[가-힣A-Za-z0-9]{2,}", kw):
+        _add_label(labels, seen, tok)
+        if len(labels) >= target:
+            return labels[:target]
+
+    if is_earnings_topic(kw, news):
+        for tok in _EARNINGS_EXTRA_LABELS:
+            _add_label(labels, seen, tok)
+            if len(labels) >= target:
+                return labels[:target]
+
+    # Pull recurring tokens from grounded headlines for topical breadth.
+    if news:
+        from collections import Counter
+
+        counter: Counter[str] = Counter()
+        for item in news[:12]:
+            title = getattr(item, "title", "") or ""
+            for tok in re.findall(r"[가-힣A-Za-z0-9]{2,}", title):
+                if tok in _LABEL_SKIP or len(tok) > 16:
+                    continue
+                counter[tok] += 1
+        for tok, _n in counter.most_common(30):
+            _add_label(labels, seen, tok)
+            if len(labels) >= target:
+                return labels[:target]
+
+    for tok in _CATEGORY_EXTRA_LABELS.get(category or "", []):
+        _add_label(labels, seen, tok)
+        if len(labels) >= target:
+            return labels[:target]
+
+    # Soft fillers that still stay informational if we are short.
+    for tok in ("트렌드", "정보", "이슈정리", "생활정보", "경제뉴스"):
+        _add_label(labels, seen, tok)
+        if len(labels) >= target:
             break
 
-    # Earnings posts get an explicit topic tag when not already present.
-    if is_earnings_topic(keyword) and "실적발표" not in labels:
-        if len(labels) < 4:
-            labels.append("실적발표")
-        else:
-            labels[-1] = "실적발표"
-
-    return labels[:4]
+    return labels[:target]
 
 
 def publish_new_post(
@@ -683,7 +740,7 @@ def main() -> None:
         content = attach_hero_image(
             creds, topic.keyword, topic.category, content, title=title
         )
-        labels = build_labels(topic.keyword, topic.category)
+        labels = build_labels(topic.keyword, topic.category, news=topic.news)
         log(
             f"[{idx}/{len(final_topics)}] '{title}' "
             f"(category={topic.category}, labels={labels})"
