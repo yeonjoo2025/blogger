@@ -230,7 +230,6 @@ def list_all_live_posts(service, blog_id: str, max_pages: int = 15) -> list[dict
 
 
 def was_recently_covered(keyword: str, recent_posts: list[dict], now: datetime, hours: int) -> bool:
-    norm_kw = normalize_keyword(keyword)
     cutoff = now - timedelta(hours=hours)
     for post in recent_posts:
         published = post.get("published")
@@ -243,8 +242,8 @@ def was_recently_covered(keyword: str, recent_posts: list[dict], now: datetime, 
         if pub_dt < cutoff:
             continue
         title = post.get("title", "")
-        norm_title = normalize_keyword(title)
-        if norm_kw and (norm_kw in norm_title or is_near_duplicate(keyword, title)):
+        # Alias-aware entity+topic matching lives in is_near_duplicate().
+        if title and is_near_duplicate(keyword, title):
             return True
     return False
 
@@ -654,12 +653,11 @@ def _pending_draft_keyword(path: Path) -> str | None:
 
 
 def _keyword_is_now_live(keyword: str, recent_posts: list[dict]) -> bool:
-    norm_kw = normalize_keyword(keyword)
-    if not norm_kw:
+    if not normalize_keyword(keyword):
         return False
     for post in recent_posts:
         title = post.get("title", "")
-        if norm_kw in normalize_keyword(title) or is_near_duplicate(keyword, title):
+        if title and is_near_duplicate(keyword, title):
             return True
     return False
 

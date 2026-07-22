@@ -199,6 +199,86 @@ def normalize_keyword(keyword: str) -> str:
     return re.sub(r"\s+", "", keyword).strip()
 
 
+_PUNCT_RE = re.compile(r"[\s\(\)\[\]\{\}\.,·,/|:;\-_\'\"“”‘’?!…~]+")
+
+# Same-issue aliases: if both sides hit the same entity family *and* the same
+# topic family, treat them as near-duplicates even when title wording differs
+# (e.g. "구글 실적발표" vs "구글(알파벳) Q2 실적 전...").
+_ENTITY_ALIAS_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"구글", "알파벳", "alphabet", "googl", "goog"}),
+    frozenset({"테슬라", "tsla", "tesla"}),
+    frozenset({"삼성전자", "삼성", "005930", "samsung"}),
+    frozenset({"마이크론", "micron", "mu"}),
+    frozenset({"엔비디아", "nvidia", "nvda"}),
+    frozenset({"애플", "apple", "aapl"}),
+    frozenset({"아마존", "amazon", "amzn"}),
+    frozenset({"메타", "meta", "페이스북", "facebook", "fb"}),
+    frozenset({"마이크로소프트", "microsoft", "msft"}),
+)
+
+_TOPIC_ALIAS_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset(
+        {
+            "실적발표",
+            "실적",
+            "어닝스",
+            "분기실적",
+            "earnings",
+            "eps",
+            "가이던스",
+            "컨센서스",
+        }
+    ),
+    frozenset({"근저당", "저당권", "담보대출"}),
+    frozenset({"관세", "tariff", "무역분쟁"}),
+    frozenset({"사이드카", "서킷브레이커"}),
+)
+
+
+def _compact_text(text: str) -> str:
+    """Lowercase + strip whitespace/punctuation for loose containment checks."""
+    return _PUNCT_RE.sub("", (text or "").lower())
+
+
+def _alias_families_in(text: str, groups: tuple[frozenset[str], ...]) -> set[frozenset[str]]:
+    compact = _compact_text(text)
+    tokens = {t.lower() for t in _tokenize(text)}
+    hits: set[frozenset[str]] = set()
+    for group in groups:
+        for term in group:
+            if term in tokens or term in compact:
+                hits.add(group)
+                break
+    return hits
+
+
+def _significant_tokens(text: str) -> set[str]:
+    """Keyword tokens used for coverage checks (drop ultra-generic crumbs)."""
+    stop = {
+        "관련",
+        "소식",
+        "이유",
+        "무엇",
+        "뭔가",
+        "보는",
+        "확인",
+        "방법",
+        "포인트",
+        "체크",
+        "총정리",
+    }
+    return {t.lower() for t in _tokenize(text) if t.lower() not in stop}
+
+
+def _token_covered(token: str, other_compact: str, other_tokens: set[str]) -> bool:
+    if token in other_tokens or token in other_compact:
+        return True
+    for group in _ENTITY_ALIAS_GROUPS + _TOPIC_ALIAS_GROUPS:
+        if token in group and (other_tokens & group or any(t in other_compact for t in group)):
+            return True
+    return False
+
+
 def group_trend_items(items: list[TrendItem]) -> dict[str, list[TrendItem]]:
     """Group raw trend items from all sources by normalized keyword text."""
     groups: dict[str, list[TrendItem]] = {}
@@ -211,10 +291,50 @@ def group_trend_items(items: list[TrendItem]) -> dict[str, list[TrendItem]]:
 
 
 def is_near_duplicate(a: str, b: str) -> bool:
+    """Stronger same-issue matcher for keyword↔title / keyword↔keyword dedupe.
+
+    Layers (any hit ⇒ duplicate):
+      1) exact / substring after whitespace normalization (legacy)
+      2) substring after punctuation-stripped compact form
+      3) shared entity-family + shared topic-family (alias-aware)
+      4) multi-token coverage: every significant token from the shorter side
+         appears in the longer side (directly or via aliases)
+    """
     na, nb = normalize_keyword(a), normalize_keyword(b)
     if not na or not nb:
         return False
     if na == nb:
         return True
     shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
-    return len(shorter) >= 2 and shorter in longer
+    if len(shorter) >= 2 and shorter in longer:
+        return True
+
+    ca, cb = _compact_text(a), _compact_text(b)
+    if not ca or not cb:
+        return False
+    c_short, c_long = (ca, cb) if len(ca) <= len(cb) else (cb, ca)
+    if len(c_short) >= 2 and c_short in c_long:
+        return True
+
+    entity_a = _alias_families_in(a, _ENTITY_ALIAS_GROUPS)
+    entity_b = _alias_families_in(b, _ENTITY_ALIAS_GROUPS)
+    topic_a = _alias_families_in(a, _TOPIC_ALIAS_GROUPS)
+    topic_b = _alias_families_in(b, _TOPIC_ALIAS_GROUPS)
+    if entity_a & entity_b and topic_a & topic_b:
+        return True
+
+    # Prefer checking the shorter *original* phrase's tokens against the other.
+    a_tokens = _significant_tokens(a)
+    b_tokens = _significant_tokens(b)
+    if not a_tokens or not b_tokens:
+        return False
+    src, other = (a, b) if len(a_tokens) <= len(b_tokens) else (b, a)
+    src_tokens = _significant_tokens(src)
+    other_compact = _compact_text(other)
+    other_tokens = _significant_tokens(other)
+    if len(src_tokens) >= 2 and all(
+        _token_covered(tok, other_compact, other_tokens) for tok in src_tokens
+    ):
+        return True
+
+    return False
