@@ -92,9 +92,19 @@ PROTECTED_SLUGS: frozenset[str] = frozenset({
 # Topic motif → (palette top/mid/accent, English scene for AI / Pillow)
 # More specific / distinctive keys are listed first. Matching prefers the
 # keyword field, then title; longer key wins when multiple hit.
+# Title-template words that must not steal the visual motif/slug away from
+# the real keyword (e.g. "구글 실적발표" + "...대출·세금에 영향..." → finance).
+_TITLE_BOILERPLATE_KEYS = {
+    "대출", "세금", "영향", "확인", "대응", "방법", "있나", "지갑", "정리",
+    "전략", "수칙", "요령", "절차",
+}
+
 TOPIC_SCENES: list[tuple[tuple[str, ...], tuple[int, int, int], tuple[int, int, int], tuple[int, int, int], str, str]] = [
     (("키미", "kimi", "인공지능", " llm", "llm "), (8, 12, 40), (60, 40, 140), (120, 230, 255),
      "ai", "futuristic AI neural network glow, abstract chip circuits, magenta and cyan light, no people"),
+    (("구글", "알파벳", "google", "alphabet", "실적발표", "실적", "어닝스", "earnings"),
+     (10, 20, 48), (30, 70, 140), (120, 220, 255),
+     "earnings", "tech earnings night: glowing blue revenue charts, abstract search-bar light streaks, city glass skyline bokeh, no logos, no people"),
     (("삼성전자", "반도체", "하이닉스", "웨이퍼"), (6, 24, 48), (20, 90, 130), (255, 214, 60),
      "chip", "semiconductor wafer fab, blue cleanroom light, abstract silicon circuit patterns, no people"),
     (("중동", "유가", "원유", "이란", "이스라엘"), (40, 20, 10), (140, 70, 30), (255, 180, 60),
@@ -174,7 +184,12 @@ def resolve_scene(keyword: str, title: str = "", category: str = "") -> tuple[
                 if len(kl) > len(hit_key) or not in_kw:
                     hit_key = kl
                     in_kw = True
-            elif not in_kw and (kl in title_l or kl in cat) and len(kl) > len(hit_key):
+            elif (
+                not in_kw
+                and kl not in _TITLE_BOILERPLATE_KEYS
+                and (kl in title_l or kl in cat)
+                and len(kl) > len(hit_key)
+            ):
                 hit_key = kl
         if not hit_key:
             continue
@@ -301,6 +316,9 @@ def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple
     hangul_len = len(re.findall(r"[가-힣]", remainder))
     if hangul_len >= 6 and len(remainder) >= 8:
         sub = _clamp_chars(remainder, target=16, hard_max=20)
+        # Avoid broken cutoffs like "...확인 방법과" / "...영향 있나?".
+        if re.search(r"(과|와|은|는|이|가|을|를|의|에|로|으로|도|만|있나\??)$", sub):
+            sub = _clamp_chars(fallback, target=16, hard_max=20)
     else:
         sub = _clamp_chars(fallback, target=16, hard_max=20)
     return main, sub
@@ -371,6 +389,11 @@ ENTITY_SLUG_MAP: list[tuple[str, str]] = [
     ("냉장고", "refrigerator"),
     ("김치", "kimchi"),
     ("가전", "appliance"),
+    ("실적발표", "earnings"),
+    ("어닝스", "earnings"),
+    ("실적", "earnings"),
+    ("알파벳", "alphabet"),
+    ("구글", "google"),
     ("대출", "loan"),
     ("세금", "tax"),
     ("kt", "kt"),
@@ -408,16 +431,21 @@ def slugify(keyword: str, title: str = "") -> str:
 
     Prefers known entity names translated/romanized to English
     (e.g. 메시+아르헨티나 -> messi-argentina, 육사 -> military-academy,
-    두산 -> doosan). Falls back to any Latin/digit tokens already present
-    in the text, and finally to a short content hash so the slug is always
-    ASCII and stable for the same topic.
+    두산 -> doosan). Keyword entities win over title-template words so a
+    post about "구글 실적발표" does not become thumb-loan-tax.jpg just
+    because the title asks about 대출·세금.
     """
-    combined = f"{keyword or ''} {title or ''}".strip()
-    tokens = _find_entity_tokens(combined, limit=2)
+    kw_tokens = _find_entity_tokens(keyword or "", limit=2)
+    title_tokens = [
+        t for t in _find_entity_tokens(title or "", limit=4)
+        if t not in {"loan", "tax"} or not kw_tokens
+    ]
+    tokens = (kw_tokens + [t for t in title_tokens if t not in kw_tokens])[:2]
     if not tokens:
         latin = re.findall(r"[A-Za-z0-9]{2,}", keyword or "") or re.findall(r"[A-Za-z0-9]{2,}", title or "")
         tokens = [t.lower() for t in latin[:2]]
     if not tokens:
+        combined = f"{keyword or ''} {title or ''}".strip()
         digest = hashlib.md5(combined.encode("utf-8")).hexdigest()[:8]
         tokens = [f"topic-{digest}"]
     slug = "-".join(tokens)
@@ -547,6 +575,28 @@ def _motif_finance(draw: ImageDraw.ImageDraw, w: int, h: int, accent: tuple[int,
         draw.ellipse([x - r, y - r, x + r, y + r], outline=accent, width=3)
 
 
+def _motif_earnings(draw: ImageDraw.ImageDraw, w: int, h: int, accent: tuple[int, int, int], rng: random.Random) -> None:
+    """Rising bar chart + soft trend line for tech earnings posts."""
+    base_y = int(h * 0.72)
+    left = int(w * 0.52)
+    bar_w = 38
+    heights = [90, 140, 120, 190, 230, 210]
+    for i, bh in enumerate(heights):
+        x0 = left + i * (bar_w + 18)
+        y0 = base_y - bh
+        fill = tuple(min(255, c + (i % 2) * 25) for c in accent)
+        draw.rounded_rectangle([x0, y0, x0 + bar_w, base_y], radius=6, fill=fill)
+    pts = []
+    for i, bh in enumerate(heights):
+        x = left + i * (bar_w + 18) + bar_w // 2
+        y = base_y - bh - 24 - rng.randint(0, 12)
+        pts.append((x, y))
+    if len(pts) >= 2:
+        draw.line(pts, fill=(255, 255, 255), width=4)
+        for x, y in pts:
+            draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(255, 255, 255))
+
+
 def paint_topic_background(
     keyword: str,
     title: str,
@@ -592,6 +642,8 @@ def paint_topic_background(
         _motif_academy(draw, width, height, accent, rng)
     elif motif == "finance":
         _motif_finance(draw, width, height, accent, rng)
+    elif motif == "earnings":
+        _motif_earnings(draw, width, height, accent, rng)
     else:
         for i in range(5):
             x0 = rng.randint(-40, width // 2)
