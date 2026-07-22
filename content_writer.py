@@ -16,6 +16,7 @@ import hashlib
 import re
 from html import escape
 
+from keyword_filter import is_earnings_topic
 from trend_sources import NewsRef
 
 # Each category has several distinct title phrasings (not just one fixed
@@ -52,6 +53,13 @@ CATEGORY_TITLE_TEMPLATES: dict[str, list[str]] = {
         "{keyword}{angle}, 소송·규제 핵심 정리와 대응 체크리스트",
     ],
 }
+
+# Earnings searches are about schedule + numbers, not generic "loan/tax" finance.
+_EARNINGS_TITLE_TEMPLATES = [
+    "{keyword}{angle}, 일정·실적 핵심과 확인 포인트 정리",
+    "{keyword}{angle} 언제·얼마? 발표 일정과 실적 포인트",
+    "{keyword}{angle}, 실적 숫자·관전 포인트와 대응 체크리스트",
+]
 _DEFAULT_TITLE_TEMPLATES = [
     "{keyword}{angle}, 무슨 일이길래? 핵심 요약과 대응법 정리",
     "{keyword}{angle} 이슈, 지금 확인해야 할 영향과 대응법",
@@ -61,7 +69,16 @@ _DEFAULT_TITLE_TEMPLATES = [
 # counts, dates - things that make a headline feel like *this specific*
 # event rather than a generic template fill-in.
 _ANGLE_RE = re.compile(
-    r"\d+(?:[.,]\d+)?\s*(?:%|퍼센트|배|만\s?원|억\s?원|조\s?원|만\s?명|명|건|개월|일|년|월)"
+    r"(?:\d+\s*분기|"
+    r"\d+\s*월\s*\d+\s*일|"
+    r"\d+(?:[.,]\d+)?\s*(?:%|퍼센트|배|만\s?원|억\s?원|조\s?원|만\s?명|명|건|개월|일|년|월))"
+)
+_SCHEDULE_RE = re.compile(
+    r"(?:\d+\s*월\s*\d+\s*일|\d+\s*분기|오늘|내일|D-\d+|발표\s*임박|실적\s*발표\s*앞두고)"
+)
+_FOCUS_TERMS = (
+    "AI", "인공지능", "클라우드", "데이터센터", "광고", "유튜브", "검색",
+    "가이던스", "컨센서스", "EPS", "매출", "영업이익", "반도체",
 )
 
 CATEGORY_ISSUE_CONTEXT = {
@@ -391,13 +408,193 @@ def _extract_angle(keyword: str, news: list[NewsRef]) -> str:
 
 
 def build_title(keyword: str, category: str, news: list[NewsRef] | None = None) -> str:
-    templates = CATEGORY_TITLE_TEMPLATES.get(category, _DEFAULT_TITLE_TEMPLATES)
+    news = news or []
+    if is_earnings_topic(keyword, news):
+        templates = _EARNINGS_TITLE_TEMPLATES
+    else:
+        templates = CATEGORY_TITLE_TEMPLATES.get(category, _DEFAULT_TITLE_TEMPLATES)
     variant = int(hashlib.md5(keyword.encode("utf-8")).hexdigest(), 16) % len(templates)
     template = templates[variant]
 
-    angle = _extract_angle(keyword, news or [])
+    angle = _extract_angle(keyword, news)
     angle_fragment = f"({angle})" if angle else ""
     return template.format(keyword=keyword, angle=angle_fragment)
+
+
+def _extract_schedule_hints(news: list[NewsRef]) -> list[str]:
+    hints: list[str] = []
+    seen: set[str] = set()
+    for item in news[:10]:
+        for match in _SCHEDULE_RE.finditer(item.title):
+            frag = re.sub(r"\s+", "", match.group(0))
+            if frag and frag not in seen:
+                seen.add(frag)
+                hints.append(frag)
+    return hints[:5]
+
+
+def _extract_focus_points(news: list[NewsRef]) -> list[str]:
+    counts: dict[str, int] = {}
+    for item in news[:12]:
+        title = item.title
+        for term in _FOCUS_TERMS:
+            if term.lower() in title.lower():
+                counts[term] = counts.get(term, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], -len(kv[0])))
+    return [term for term, n in ranked if n >= 1][:6]
+
+
+def build_earnings_issue_section(keyword: str, news: list[NewsRef]) -> str:
+    parts = [_h3("1. 이슈가 무엇인가")]
+    headlines = _unique_headlines(news, 6)
+    schedules = _extract_schedule_hints(news)
+    focuses = _extract_focus_points(news)
+
+    parts.append(
+        _p(
+            f"'{keyword}' 검색이 늘 때는 보통 ‘언제 나오는지’와 ‘숫자·가이던스가 어떻게 나왔는지’를 "
+            f"확인하려는 수요가 겹칩니다. 아래는 현재 보도를 기준으로 일정·관전 포인트만 먼저 정리한 내용입니다."
+        )
+    )
+    if schedules:
+        parts.append(_p("보도에서 반복되는 일정·시점 힌트입니다. 공식 IR 캘린더와 교차 확인하세요."))
+        parts.append(_ul([f"일정 힌트: {s}" for s in schedules]))
+    if focuses:
+        parts.append(
+            _p(
+                "시장이 이번 발표에서 특히 보는 키워드는 다음과 같습니다. "
+                "실제 숫자는 회사 IR/SEC 공시 원문을 기준으로 보세요."
+            )
+        )
+        parts.append(_ul([f"관전 포인트: {f}" for f in focuses]))
+    if headlines:
+        parts.append(_p("주요 보도에서 확인되는 골격입니다."))
+        parts.append(
+            _ul([f"{_clean_headline(item.title)}" + (f" ({item.source})" if item.source else "") for item in headlines])
+        )
+    parts.append(
+        _p(
+            "프리뷰 기사와 실제 발표는 다를 수 있습니다. ‘예상치’와 ‘실제 발표치’, "
+            "그리고 다음 분기 가이던스를 구분해 메모해 두면 이후 확인이 빨라집니다."
+        )
+    )
+    return "".join(parts)
+
+
+def build_earnings_impact_section(keyword: str) -> str:
+    return "".join(
+        [
+            _h3("2. 무엇이 영향받는가"),
+            _p(
+                f"'{keyword}'는 해당 기업 주가뿐 아니라 관련 테마(반도체·클라우드·광고·AI 인프라)와 "
+                f"국내외 연계 종목·ETF 변동성에도 영향을 줄 수 있습니다."
+            ),
+            _p("특히 아래 유형이라면 발표 전후 구간을 더 자세히 보는 편이 좋습니다."),
+            _ul(
+                [
+                    "해당 기업·모회사 주식이나 ADR을 보유/관심 중인 투자자",
+                    "관련 반도체·클라우드·광고 테마 종목·ETF를 담은 사람",
+                    "실적 시즌 변동성에 노출된 단기·스윙 트레이더",
+                    "연금·ISA 등으로 동일 테마에 간접 노출된 투자자",
+                ]
+            ),
+            _p("영향 경로를 구체적으로 보면 다음과 같습니다."),
+            _ul(
+                [
+                    "매출·영업이익·EPS가 컨센서스를 상회/하회하면 시간외·정규장 변동폭이 커질 수 있습니다.",
+                    "AI 투자·캡엑스·클라우드 성장률 같은 질적 지표가 가이던스와 어긋나면 테마주까지 동반 움직일 수 있습니다.",
+                    "미국 빅테크 실적은 국내 반도체·장비주 심리에도 전이되는 경우가 많습니다.",
+                ]
+            ),
+        ]
+    )
+
+
+def build_earnings_check_section(keyword: str) -> str:
+    return "".join(
+        [
+            _h3("3. 관련해서 확인할 방법"),
+            _p(
+                f"'{keyword}'는 검색 요약보다 ‘공식 일정 → 실제 숫자 → 내 보유 종목’ 순서로 확인하는 것이 안전합니다."
+            ),
+            _ul(
+                [
+                    "회사 Investor Relations / SEC EDGAR(또는 거래소 공시)에서 발표 일정과 실적 자료를 확인합니다.",
+                    "매출, 영업이익, EPS, 클라우드/광고 등 핵심 부문 성장률을 컨센서스와 비교합니다.",
+                    "다음 분기·연간 가이던스와 캡엑스(설비투자) 코멘트를 별도로 적어 둡니다.",
+                    "증권사 프리뷰와 실제 발표 후 리액션 기사에서 ‘예상 대비 어디가 달랐는지’를 확인합니다.",
+                    "본인 계좌의 해당 종목·관련 ETF 비중, 예약주문, 환율 노출을 앱에서 재확인합니다.",
+                ]
+            ),
+            _p(
+                "일정과 수치는 매체마다 시차가 있습니다. 가능하면 회사 원문 자료의 타임스탬프를 기준으로 정리하세요."
+            ),
+        ]
+    )
+
+
+def build_earnings_response_section(keyword: str) -> str:
+    return "".join(
+        [
+            _h3("4. 해결·대응 방법"),
+            _p(
+                f"'{keyword}' 대응의 핵심은 ‘속보 제목으로 바로 매매’보다 "
+                f"숫자 확인 → 보유 비중 점검 → 후속 가이던스 추적 순서입니다."
+            ),
+            _ul(
+                [
+                    "발표 전: 본인 비중과 손실 허용 범위를 먼저 정해 두고, 추측성 선매매를 줄입니다.",
+                    "발표 직후: 매출·이익·가이던스 3가지만 먼저 표로 정리한 뒤 매매 여부를 판단합니다.",
+                    "관련 테마주까지 흔들리면 동일 리스크가 중복인지(반도체·클라우드 등) 비중을 재계산합니다.",
+                    "추가 매수/매도 전이라면 분할 집행이나 관망으로 속도를 낮춥니다.",
+                    "발표 다음 1~2거래일 리액션과 애널리스트 목표주가 변경을 후속으로 확인합니다.",
+                ]
+            ),
+            _p("피해야 할 실수도 분명합니다."),
+            _ul(
+                [
+                    "프리뷰 기사만 보고 실제 숫자 확인 전에 전량 매수·매도하는 것",
+                    "‘어닝스 비트’ 헤드라인만 보고 가이던스 하향을 놓치는 것",
+                    "레버리지·미수 상태에서 변동성 구간을 버티려다 강제청산 위험을 키우는 것",
+                ]
+            ),
+        ]
+    )
+
+
+def build_earnings_faq_section() -> str:
+    faqs = [
+        (
+            "실적발표에서 뭐부터 보면 되나요?",
+            "일정(언제) → 매출·영업이익·EPS(얼마) → 가이던스/캡엑스(앞으로) 순서가 가장 실용적입니다.",
+        ),
+        (
+            "컨센서스를 넘기면 무조건 호재인가요?",
+            "아닙니다. 이번 분기 숫자는 좋아도 다음 분기 가이던스가 낮으면 주가가 반대로 움직일 수 있습니다.",
+        ),
+    ]
+    parts = [
+        _h3("자주 묻는 포인트"),
+        _p("실적발표를 검색하는 사람들이 실제로 자주 묻는 지점만 짧게 정리했습니다."),
+    ]
+    for q, a in faqs:
+        parts.append(_p(f"Q. {q}"))
+        parts.append(_p(f"A. {a}"))
+    return "".join(parts)
+
+
+def build_earnings_summary_section(keyword: str) -> str:
+    return "".join(
+        [
+            _h3("한눈에 정리"),
+            _p(
+                f"1) '{keyword}'는 일정과 실적 숫자를 확인하려는 검색 수요가 큰 투자 이슈입니다. "
+                f"2) 영향은 해당 종목뿐 아니라 관련 테마·국내 연계주로 번질 수 있습니다. "
+                f"3) 공식 IR/공시로 일정·숫자를 확인하고, 4) 비중·가이던스 기준으로 대응한 뒤 "
+                f"5) 후속 보도로 업데이트하면 됩니다."
+            ),
+        ]
+    )
 
 
 def _p(text: str) -> str:
@@ -591,17 +788,32 @@ def build_summary_section(keyword: str, category: str) -> str:
 
 
 def build_body_html(keyword: str, category: str, news: list[NewsRef]) -> str:
-    sections = [
-        build_issue_section(keyword, category, news),
-        build_impact_section(keyword, category),
-        build_check_section(keyword, category),
-        build_response_section(keyword, category),
-        build_faq_section(category),
-        build_related_news_section(news),
-        build_summary_section(keyword, category),
-        _p(
-            "본 글은 공개된 트렌드 지표와 언론 보도를 바탕으로 정리한 정보성 콘텐츠입니다. "
-            "수치, 일정, 적용 대상은 이후 공식 발표에 따라 달라질 수 있으니 최신 공지를 함께 확인하시기 바랍니다."
-        ),
-    ]
+    if is_earnings_topic(keyword, news):
+        sections = [
+            build_earnings_issue_section(keyword, news),
+            build_earnings_impact_section(keyword),
+            build_earnings_check_section(keyword),
+            build_earnings_response_section(keyword),
+            build_earnings_faq_section(),
+            build_related_news_section(news),
+            build_earnings_summary_section(keyword),
+            _p(
+                "본 글은 공개된 트렌드 지표와 언론 보도를 바탕으로 정리한 정보성 콘텐츠입니다. "
+                "실적 수치·발표 일정은 회사 공식 IR/공시 원문을 최종 기준으로 확인하시기 바랍니다."
+            ),
+        ]
+    else:
+        sections = [
+            build_issue_section(keyword, category, news),
+            build_impact_section(keyword, category),
+            build_check_section(keyword, category),
+            build_response_section(keyword, category),
+            build_faq_section(category),
+            build_related_news_section(news),
+            build_summary_section(keyword, category),
+            _p(
+                "본 글은 공개된 트렌드 지표와 언론 보도를 바탕으로 정리한 정보성 콘텐츠입니다. "
+                "수치, 일정, 적용 대상은 이후 공식 발표에 따라 달라질 수 있으니 최신 공지를 함께 확인하시기 바랍니다."
+            ),
+        ]
     return "\n".join(s for s in sections if s)

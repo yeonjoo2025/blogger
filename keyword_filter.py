@@ -43,6 +43,8 @@ INCLUDE_CATEGORIES: dict[str, list[str]] = {
         "투자", "재테크", "비트코인", "이더리움", "암호화폐", "가상자산", "코인",
         "ETF", "펀드", "채권", "금값", "유가", "반도체", "주식", "블랙록", "헤지펀드",
         "테슬라", "나스닥", "매수", "매도",
+        "실적발표", "실적", "어닝스", "분기실적", "컨센서스", "EPS", "가이던스",
+        "클라우드", "알파벳", "구글", "빅테크",
     ],
     "건강": [
         "감염", "확산", "유행", "독감", "코로나", "백신", "부작용", "리콜",
@@ -122,11 +124,27 @@ def _count_hits(text: str, terms: list[str]) -> int:
     return sum(1 for t in terms if t in text)
 
 
+_EARNINGS_MARKERS = ("실적발표", "실적 발표", "어닝스", "분기실적", "earnings")
+
+
+def is_earnings_topic(keyword: str, news: list[NewsRef] | None = None) -> bool:
+    text = keyword or ""
+    if news:
+        text += " " + " ".join(n.title for n in news[:6])
+    return any(m in text for m in _EARNINGS_MARKERS)
+
+
 def classify(keyword: str, news: list[NewsRef]) -> tuple[str | None, int, int]:
     """Return (best_category_or_None, include_hits, exclude_hits)."""
     corpus = keyword + " " + " ".join(n.title for n in news)
 
     exclude_hits = _count_hits(corpus, EXCLUDE_TERMS)
+
+    # Earnings-release searches are investment intent (schedule/results),
+    # not household loan/tax finance - force that lane early.
+    if is_earnings_topic(keyword, news):
+        hits = _count_hits(corpus, INCLUDE_CATEGORIES["투자"])
+        return "투자", max(hits, MIN_NET_SCORE), exclude_hits
 
     best_category = None
     best_hits = 0

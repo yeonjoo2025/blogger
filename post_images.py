@@ -306,13 +306,16 @@ def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple
     for tok in re.findall(r"[가-힣A-Za-z0-9]{2,}", main):
         remainder = remainder.replace(tok, " ")
     remainder = re.sub(r"\s+", " ", remainder).strip(" ,-·")
-    fallback = {
-        "금융": "지갑에 미치는 영향과 대응 포인트",
-        "투자": "투자자 영향과 대응 전략 정리",
-        "건강": "건강에 미치는 영향과 대응 수칙",
-        "생활안전": "안전 영향과 대피 요령 정리",
-        "법률": "법적 영향과 대응 절차 정리",
-    }.get(category, "핵심 이슈와 대응 방법 정리")
+    if any(k in (keyword or "") or k in title for k in ("실적발표", "실적 발표", "어닝스")):
+        fallback = "발표 일정과 실적 숫자 확인 포인트"
+    else:
+        fallback = {
+            "금융": "지갑에 미치는 영향과 대응 포인트",
+            "투자": "투자자 영향과 대응 전략 정리",
+            "건강": "건강에 미치는 영향과 대응 수칙",
+            "생활안전": "안전 영향과 대피 요령 정리",
+            "법률": "법적 영향과 대응 절차 정리",
+        }.get(category, "핵심 이슈와 대응 방법 정리")
     hangul_len = len(re.findall(r"[가-힣]", remainder))
     if hangul_len >= 6 and len(remainder) >= 8:
         sub = _clamp_chars(remainder, target=16, hard_max=20)
