@@ -116,10 +116,17 @@ def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple
     hangul_count = len(re.findall(r"[가-힣]", main_src))
     is_pipeline_title = "무슨 일이길래" in title
     if hangul_count <= 2 and not is_pipeline_title:
-        extras = re.findall(r"[가-힣A-Za-z0-9]{2,}", title)
+        preferred = ("국가대표", "은퇴", "구속", "급등", "급락", "판결", "리콜", "대피")
+        clause = title
+        if "," in title:
+            clause = title.split(",", 1)[1]
+        clause = clause.split("…")[0].split("...")[0]
+        extras = re.findall(r"[가-힣A-Za-z0-9]{2,}", clause)
+        extras = [t for t in extras if t not in stop]
+        extras.sort(key=lambda t: (0 if t in preferred else 1))
         built = main_src
         for tok in extras:
-            if tok in built or tok in stop:
+            if tok in built:
                 continue
             trial = f"{built} {tok}".strip()
             if len(trial) > 12:
@@ -154,6 +161,10 @@ def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple
         "법률": "법적 영향과 대응 절차",
     }.get(category, "핵심 이슈와 대응 정리")
     # Prefer remainder only when it still looks like a real Korean phrase.
+    # Drop tokens already used in the main headline so sub doesn't repeat it.
+    for tok in re.findall(r"[가-힣A-Za-z0-9]{2,}", main):
+        remainder = remainder.replace(tok, " ")
+    remainder = re.sub(r"\s+", " ", remainder).strip(" ,-·")
     hangul_len = len(re.findall(r"[가-힣]", remainder))
     if hangul_len >= 5 and len(remainder) >= 6:
         sub = _clamp_chars(remainder, target=14, hard_max=18)
