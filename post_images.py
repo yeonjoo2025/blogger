@@ -489,9 +489,13 @@ def compose_news_thumbnail(
     width, height = img.size
     draw = ImageDraw.Draw(img)
 
-    banner_top = int(height * 0.62)
-    draw.rectangle([0, banner_top, width, height], fill=(0, 0, 0, 185))
-    draw.rectangle([0, banner_top, width, banner_top + 5], fill=(*accent, 230))
+    # Soft gradient lower-third (not a hard black slab) so topic plates stay visible.
+    banner_top = int(height * 0.58)
+    for y in range(banner_top, height):
+        t = (y - banner_top) / max(1, height - banner_top)
+        alpha = int(90 + 110 * t)  # 90 → 200
+        draw.line([(0, y), (width, y)], fill=(0, 0, 0, alpha))
+    draw.rectangle([0, banner_top, width, banner_top + 4], fill=(*accent, 230))
 
     main_size = 78
     main_font = _pick_font(main_size)
