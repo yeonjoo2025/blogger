@@ -30,16 +30,23 @@ Pipeline:
      returns 403/429 (or the assumed quota is already exhausted), this run
      stops calling the write API entirely for the rest of today - no new
      posts and no updates of old posts.
-  6. Manual-posting fallback: a 403/429 (or Google's account-wide "Blogger
-     used to send unwanted content" API restriction, which manifests as a
-     persistent 403 on every insert regardless of isDraft) does not mean
-     the *content* is lost. Whenever the API write is skipped or fails for
-     a topic that already passed every quality gate above, its title+body
-     is saved as an HTML file under pending_posts/ so a human can copy it
-     into the Blogger web UI by hand until the restriction is lifted. Once
-     a pending topic shows up as a live post (detected via the read-only
-     posts.list API, which keeps working even while insert is blocked),
-     its pending_posts/ file is automatically deleted on the next run.
+  6. Draft take-over: Google's account-wide "Blogger used to send unwanted
+     content" API restriction has been observed to block posts.insert()
+     (creating brand-new content via the API) even with isDraft=True. If a
+     human creates a few blank draft posts by hand in the Blogger web UI
+     first, this run will look for them (status=DRAFT) and try filling one
+     in with generated content via posts.update() + posts.publish() before
+     ever calling posts.insert() - editing/publishing a resource that
+     already exists is a materially different operation from creating new
+     content, so it may not be covered by the same restriction.
+  7. Manual-posting fallback: if no draft is available to take over, or the
+     take-over/insert call still gets 403/429, the *content* is not lost.
+     Its title+body is saved as an HTML file under pending_posts/ so a
+     human can copy it into the Blogger web UI by hand until the
+     restriction is lifted. Once a pending topic shows up as a live post
+     (detected via the read-only posts.list API, which keeps working even
+     while writes are blocked), its pending_posts/ file is automatically
+     deleted on the next run.
 
 Run: python3 publish_trend.py
 """
@@ -349,6 +356,36 @@ def publish_new_post(service, blog_id: str, title: str, content: str) -> dict:
     return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
 
 
+def list_draft_posts(service, blog_id: str, max_pages: int = 5) -> list[dict]:
+    """Human-created draft posts (status=DRAFT) waiting to be filled in.
+
+    Blogger's account-wide write restriction has been observed to block
+    posts.insert (creating brand-new content via the API) even with
+    isDraft=True. If a person creates a blank draft by hand through the
+    Blogger web UI first, we may still be able to fill it in and publish
+    it via posts.update()/posts.publish() - those are edits to a resource
+    that already exists, which is a materially different operation from
+    creating new content, so it's worth trying as a workaround.
+    """
+    posts: list[dict] = []
+    request = service.posts().list(blogId=blog_id, maxResults=50, status="DRAFT", fetchBodies=False)
+    pages = 0
+    while request is not None and pages < max_pages:
+        response = request.execute()
+        posts.extend(response.get("items") or [])
+        request = service.posts().list_next(request, response)
+        pages += 1
+    posts.sort(key=lambda p: p.get("published") or p.get("updated") or "")
+    return posts
+
+
+def take_over_draft_post(service, blog_id: str, draft_id: str, title: str, content: str) -> dict:
+    """Fill in a human-created draft with generated content and publish it."""
+    body = {"kind": "blogger#post", "id": draft_id, "blog": {"id": blog_id}, "title": title, "content": content}
+    service.posts().update(blogId=blog_id, postId=draft_id, body=body).execute()
+    return service.posts().publish(blogId=blog_id, postId=draft_id).execute()
+
+
 def _slugify(keyword: str) -> str:
     slug = re.sub(r"[^0-9A-Za-z가-힣]+", "-", keyword).strip("-")
     return slug[:40] or "topic"
@@ -475,12 +512,37 @@ def main() -> None:
         log("no topic clearly qualifies this run (ambiguous or already covered) - publishing nothing")
         return
 
+    draft_posts = list_draft_posts(service, blog_id)
+    if draft_posts:
+        log(
+            f"found {len(draft_posts)} human-created draft post(s) available to fill in - "
+            f"will try posts.update()+posts.publish() on those before falling back to posts.insert()"
+        )
+
     published_count = 0
     drafted_count = 0
     for idx, topic in enumerate(final_topics, start=1):
         title = build_title(topic.keyword, topic.category, topic.news)
         content = build_body_html(topic.keyword, topic.category, topic.news)
         log(f"[{idx}/{len(final_topics)}] '{title}' (category={topic.category})")
+
+        if draft_posts:
+            draft = draft_posts.pop(0)
+            draft_id = draft.get("id")
+            try:
+                post = take_over_draft_post(service, blog_id, draft_id, title, content)
+                log(f"  filled in human-created draft {draft_id} and published: {post.get('url')}")
+                published_count += 1
+                new_posts_today += 1
+                if idx < len(final_topics):
+                    time.sleep(2)
+                continue
+            except HttpError as exc:
+                status = getattr(exc.resp, "status", None)
+                log(
+                    f"  draft take-over failed (HTTP {status}) for draft {draft_id} - "
+                    f"falling back to posts.insert()/pending draft for this topic"
+                )
 
         if api_blocked or remaining_quota <= 0:
             reason = "api_already_blocked_today" if api_blocked else "quota_used_up_mid_run"

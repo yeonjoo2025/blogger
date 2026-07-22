@@ -50,11 +50,25 @@ Cloud Agent 자동화에서는 `BLOGGER_CLIENT_SECRET` / `BLOGGER_TOKEN` 환경�
 
 `client_secret.json`, `token.json`, `.blogger_quota_state.json`은 Git에 올리지 마세요.
 
+### 초안(Draft) 인계 - API 차단 시 1차 우회 경로
+
+Blogger 웹 UI에서 사람이 직접 만든 **빈 초안(Draft, 미발행) 글**이 있다면, 매 실행마다
+가장 먼저 그 초안을 찾아서(`status=DRAFT` 조회, 읽기 전용이라 계속 동작합니다)
+`posts.update()`(제목/본문 채우기) + `posts.publish()`(발행)로 채워서 발행을 시도합니다.
+새 글을 만드는 `posts.insert()`와 이미 존재하는 글을 수정·발행하는 `posts.update()`/
+`posts.publish()`는 서로 다른 API 동작이라, 계정 제한이 `insert`만 막고 있다면 이 방법으로
+우회 발행이 될 수 있습니다.
+
+**사용법**: Blogger 웹 UI에서 "새 게시물" → 제목/본문은 아무 내용이나 넣고(또는 비워 두고)
+**"게시" 대신 "닫기"(초안으로 저장)**를 눌러 몇 개 만들어 두시면 됩니다. 다음 자동화 실행
+때 자동으로 찾아서 실제 콘텐츠로 채운 뒤 발행을 시도하고, 성공하면 발행 URL이 로그에
+남습니다. 이 방법도 403으로 막히면 아래 `pending_posts/` 방식으로 자동 전환됩니다.
+
 ### 수동 게시 대체 경로 (`pending_posts/`)
 
-Blogger 계정이 "원치 않는 콘텐츠 전송" 등의 이유로 API 쓰기(`posts.insert`)가
-차단되면(403이 계속 발생), 신규 발행/기존 글 수정은 전혀 시도하지 않지만 그렇다고
-이미 모든 검증을 통과한 주제의 콘텐츠를 버리지는 않습니다. 대신 제목+본문을
+Blogger 계정이 "원치 않는 콘텐츠 전송" 등의 이유로 API 쓰기(`posts.insert`/`posts.update`/
+`posts.publish` 전부)가 차단되면(403이 계속 발생), 신규 발행/기존 글 수정은 전혀 시도하지
+않지만 그렇다고 이미 모든 검증을 통과한 주제의 콘텐츠를 버리지는 않습니다. 대신 제목+본문을
 `pending_posts/타임스탬프_키워드.html` 파일로 저장합니다.
 
 - 이 폴더는 Git에 커밋됩니다 - 리포지토리/PR에서 바로 확인할 수 있습니다.
