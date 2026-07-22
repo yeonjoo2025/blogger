@@ -12,17 +12,57 @@ leaving the page for basic context.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from html import escape
 
 from trend_sources import NewsRef
 
-CATEGORY_HOOK = {
-    "금융": "지갑에 영향, 확인·대응법",
-    "투자": "투자자 영향과 대응 전략",
-    "건강": "건강 영향과 대응 수칙",
-    "생활안전": "안전 영향과 대피·대응 방법",
-    "법률": "법적 영향과 대응 방법",
+# Each category has several distinct title phrasings (not just one fixed
+# template) so that two unrelated topics in the same category don't end up
+# with mechanically identical titles. build_title() picks one deterministically
+# per keyword (stable across runs) and, when a concrete fact (a number,
+# percentage, amount, or date) can be pulled from the real headlines, weaves
+# it in so the title reflects *this* topic's content rather than a generic
+# category label.
+CATEGORY_TITLE_TEMPLATES: dict[str, list[str]] = {
+    "금융": [
+        "{keyword}{angle}, 무슨 일이길래? 지갑에 영향, 확인·대응법 정리",
+        "{keyword}{angle} 이슈 정리 - 내 지갑에 미치는 영향과 대응 체크리스트",
+        "{keyword}{angle}, 대출·세금에 영향 있나? 확인 방법과 대응법",
+    ],
+    "투자": [
+        "{keyword}{angle}, 무슨 일이길래? 투자자 영향과 대응 전략 정리",
+        "{keyword}{angle} 이슈, 내 포트폴리오에 미치는 영향과 대응 전략",
+        "{keyword}{angle} 급등락 배경과 투자자가 지금 확인할 것들",
+    ],
+    "건강": [
+        "{keyword}{angle}, 무슨 일이길래? 건강 영향과 대응 수칙 정리",
+        "{keyword}{angle} 확산 - 증상·리콜 확인법과 대응 수칙",
+        "{keyword}{angle}, 우리 가족은 안전할까? 확인법과 대응 수칙",
+    ],
+    "생활안전": [
+        "{keyword}{angle}, 무슨 일이길래? 안전 영향과 대피·대응 방법 정리",
+        "{keyword}{angle} 발생 - 우리 동네 영향 확인법과 대피 요령",
+        "{keyword}{angle}, 지금 확인해야 할 안전 수칙과 대응 방법",
+    ],
+    "법률": [
+        "{keyword}{angle}, 무슨 일이길래? 법적 영향과 대응 방법 정리",
+        "{keyword}{angle} 이슈, 나에게도 영향 있을까? 확인법과 대응 절차",
+        "{keyword}{angle}, 소송·규제 핵심 정리와 대응 체크리스트",
+    ],
 }
+_DEFAULT_TITLE_TEMPLATES = [
+    "{keyword}{angle}, 무슨 일이길래? 핵심 요약과 대응법 정리",
+    "{keyword}{angle} 이슈, 지금 확인해야 할 영향과 대응법",
+]
+
+# Concrete, real facts worth surfacing in a title: percentages, amounts,
+# counts, dates - things that make a headline feel like *this specific*
+# event rather than a generic template fill-in.
+_ANGLE_RE = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:%|퍼센트|배|만\s?원|억\s?원|조\s?원|만\s?명|명|건|개월|일|년|월)"
+)
 
 CATEGORY_ISSUE_CONTEXT = {
     "금융": (
@@ -320,9 +360,30 @@ def _clean_headline(title: str) -> str:
     return title[:120]
 
 
-def build_title(keyword: str, category: str) -> str:
-    hook = CATEGORY_HOOK.get(category, "핵심 요약과 대응법")
-    return f"{keyword}, 무슨 일이길래? {hook} 정리"
+def _extract_angle(keyword: str, news: list[NewsRef]) -> str:
+    """Pull a short concrete fact (a number/%/amount/date) from the real
+    headlines so the title reflects this specific topic's content instead
+    of a bare category label. Returns "" when nothing usable is found, or
+    when the match is already part of the keyword itself.
+    """
+    for item in news[:5]:
+        match = _ANGLE_RE.search(item.title)
+        if not match:
+            continue
+        frag = re.sub(r"\s+", "", match.group(0))
+        if frag and frag not in keyword and len(frag) <= 10:
+            return frag
+    return ""
+
+
+def build_title(keyword: str, category: str, news: list[NewsRef] | None = None) -> str:
+    templates = CATEGORY_TITLE_TEMPLATES.get(category, _DEFAULT_TITLE_TEMPLATES)
+    variant = int(hashlib.md5(keyword.encode("utf-8")).hexdigest(), 16) % len(templates)
+    template = templates[variant]
+
+    angle = _extract_angle(keyword, news or [])
+    angle_fragment = f"({angle})" if angle else ""
+    return template.format(keyword=keyword, angle=angle_fragment)
 
 
 def _p(text: str) -> str:

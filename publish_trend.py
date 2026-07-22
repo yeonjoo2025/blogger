@@ -240,14 +240,27 @@ def was_recently_covered(keyword: str, recent_posts: list[dict], now: datetime, 
     return False
 
 
+def _is_duplicate_of_pending(keyword: str, pending_keywords: set[str]) -> bool:
+    return any(is_near_duplicate(keyword, kw) for kw in pending_keywords)
+
+
 def select_final_topics(
-    candidates: list[TopicCandidate], recent_posts: list[dict], now: datetime
+    candidates: list[TopicCandidate],
+    recent_posts: list[dict],
+    now: datetime,
+    pending_keywords: set[str] | None = None,
 ) -> list[TopicCandidate]:
     """Greedily take the strongest candidates, but favor topical diversity:
     one same-day run should not turn into three near-identical "오늘 미국
     증시" posts just because that theme happened to dominate the trend
     feed. Each category gets picked at most once before we allow repeats.
+
+    A topic is skipped not only when a *live* post already covers it
+    (was_recently_covered), but also when a pending_posts/ draft for it is
+    already waiting on a human to publish manually - otherwise every 4-hour
+    run would keep re-drafting the same still-unpublished topic.
     """
+    pending_keywords = pending_keywords or set()
     final: list[TopicCandidate] = []
     used_categories: set[str] = set()
 
@@ -258,6 +271,9 @@ def select_final_topics(
             continue
         if was_recently_covered(cand.keyword, recent_posts, now, DEDUPE_LOOKBACK_HOURS):
             log(f"  drop '{cand.keyword}': already covered by a recent post")
+            continue
+        if _is_duplicate_of_pending(cand.keyword, pending_keywords):
+            log(f"  drop '{cand.keyword}': already waiting as a pending draft")
             continue
         final.append(cand)
         used_categories.add(cand.category)
@@ -274,6 +290,8 @@ def select_final_topics(
         if any(is_near_duplicate(cand.keyword, f.keyword) for f in final):
             continue
         if was_recently_covered(cand.keyword, recent_posts, now, DEDUPE_LOOKBACK_HOURS):
+            continue
+        if _is_duplicate_of_pending(cand.keyword, pending_keywords):
             continue
         final.append(cand)
 
@@ -394,6 +412,20 @@ def cleanup_resolved_pending_drafts(recent_posts: list[dict]) -> int:
     return removed
 
 
+def pending_draft_keywords() -> set[str]:
+    """Keywords of pending_posts/ drafts still waiting on a human to
+    publish - used to avoid re-drafting the same unpublished topic every
+    run while the write API stays blocked."""
+    if not PENDING_DIR.exists():
+        return set()
+    keywords: set[str] = set()
+    for path in PENDING_DIR.glob("*.html"):
+        keyword = _pending_draft_keyword(path)
+        if keyword:
+            keywords.add(keyword)
+    return keywords
+
+
 def main() -> None:
     now = datetime.now(timezone.utc)
 
@@ -437,7 +469,8 @@ def main() -> None:
     candidates = build_candidates(now)
     log(f"{len(candidates)} candidates qualified after news-grounded filtering")
 
-    final_topics = select_final_topics(candidates, recent_posts, now)
+    pending_keywords = pending_draft_keywords()
+    final_topics = select_final_topics(candidates, recent_posts, now, pending_keywords)
     if not final_topics:
         log("no topic clearly qualifies this run (ambiguous or already covered) - publishing nothing")
         return
@@ -445,7 +478,7 @@ def main() -> None:
     published_count = 0
     drafted_count = 0
     for idx, topic in enumerate(final_topics, start=1):
-        title = build_title(topic.keyword, topic.category)
+        title = build_title(topic.keyword, topic.category, topic.news)
         content = build_body_html(topic.keyword, topic.category, topic.news)
         log(f"[{idx}/{len(final_topics)}] '{title}' (category={topic.category})")
 
