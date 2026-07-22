@@ -66,6 +66,7 @@ from googleapiclient.errors import HttpError
 
 from blogger_auth import load_credentials
 from content_writer import build_body_html, build_title
+from post_images import build_and_host_hero, inject_hero_image
 from keyword_filter import (
     TopicCandidate,
     classify,
@@ -427,6 +428,20 @@ def take_over_live_placeholder(service, blog_id: str, post_id: str, title: str, 
     return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
 
 
+def attach_hero_image(creds, keyword: str, category: str, content: str) -> str:
+    """Generate + host a header image and prepend it to the HTML body.
+
+    Failures are non-fatal: a missing image must never block publishing the
+    text content itself.
+    """
+    try:
+        url = build_and_host_hero(creds, keyword, category)
+        return inject_hero_image(content, url, alt=keyword)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  hero image skipped for '{keyword}': {exc}")
+        return content
+
+
 def _slugify(keyword: str) -> str:
     slug = re.sub(r"[^0-9A-Za-z가-힣]+", "-", keyword).strip("-")
     return slug[:40] or "topic"
@@ -574,6 +589,7 @@ def main() -> None:
     for idx, topic in enumerate(final_topics, start=1):
         title = build_title(topic.keyword, topic.category, topic.news)
         content = build_body_html(topic.keyword, topic.category, topic.news)
+        content = attach_hero_image(creds, topic.keyword, topic.category, content)
         log(f"[{idx}/{len(final_topics)}] '{title}' (category={topic.category})")
 
         if placeholder_posts:

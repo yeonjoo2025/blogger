@@ -13,6 +13,7 @@ python publish_test.py   # 테스트 발행
 python read_recent_posts.py --limit 6
 python format_latest_post_for_slack.py
 python publish_trend.py  # 트렌드 수집 → 필터링 → 정보성 글 발행
+python backfill_post_images.py  # 이미지 없는 LIVE 글에 헤더 이미지 추가
 ```
 
 ## publish_trend.py
@@ -26,6 +27,9 @@ python publish_trend.py  # 트렌드 수집 → 필터링 → 정보성 글 발�
 - `keyword_filter.py`: 연예·스포츠·단순 인명 이슈를 제외하고, 실제 보도 내용을 근거로
   금융/투자/건강/생활안전/법률 카테고리 여부와 "한 사건에 대한 보도인지(헤드라인 응집도)"를 판단합니다.
 - `content_writer.py`: 실제 뉴스 헤드라인을 근거로 5단 구조의 본문과 제목을 생성합니다.
+- `post_images.py`: 카테고리별 헤더 이미지를 Pillow로 생성한 뒤 Blogger 포토 스토리지에
+  업로드하고, 본문 상단에 `<img>`로 삽입합니다. `publish_trend.py`가 매 발행 시 자동 호출합니다.
+- `backfill_post_images.py`: 이미 올라간 LIVE 글 중 이미지가 없는 글에 헤더 이미지를 추가합니다.
 - `publish_trend.py`: 위 과정을 조율하고 Blogger에 발행합니다. 신규 발행 한도가 막히면
   (또는 403/429) 그날은 더 이상 글을 생성·수정하지 않고 종료합니다. 애매한 키워드는 억지로 쓰지 않고 건너뜁니다.
 
