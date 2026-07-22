@@ -7,7 +7,7 @@
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install google-auth-oauthlib google-auth-httplib2 google-api-python-client requests
+pip install -r requirements.txt
 python get_token.py      # OAuth 토큰 1회 발급 → token.json 생성
 python publish_test.py   # 테스트 발행
 python read_recent_posts.py --limit 6
@@ -15,6 +15,32 @@ python format_latest_post_for_slack.py
 python publish_trend.py  # 트렌드 수집 → 필터링 → 정보성 글 발행
 python backfill_post_images.py  # 이미지 없는 LIVE 글에 헤더 이미지 추가
 ```
+
+## 자동화 실행 순서 (매 사이클 필수)
+
+Cloud Agent/cron 환경은 매번 새 VM에서 시작될 수 있으므로, 아래 순서를 매 실행마다
+빠짐없이 수행해야 합니다 (사람이 직접 실행할 필요는 없음 — `blogger_auth.py`가 1·2번을,
+아래 커맨드가 3·4번을 담당):
+
+1. 환경변수 `BLOGGER_CLIENT_SECRET`(또는 `BLOGGER_CLIENT_SECRET_JSON`) 내용을
+   `client_secret.json`으로 저장 — `blogger_auth.ensure_client_secret_file()`이
+   `load_credentials()` 호출 시 자동 수행
+2. 환경변수 `BLOGGER_TOKEN`(또는 `BLOGGER_TOKEN_JSON`) 내용을 `token.json`으로 저장 —
+   `blogger_auth.ensure_token_file()`이 `load_credentials()` 호출 시 자동 수행
+3. 의존성 설치: `python3 -m pip install -r requirements.txt`
+   (또는 `python3 -m pip install google-auth-oauthlib google-auth-httplib2
+   google-api-python-client requests Pillow`) — 매번 새 VM일 수 있으므로 매 실행 전 확인
+4. 실행: `python3 publish_trend.py`
+
+권장 자동화 Command (한 줄):
+
+```bash
+python3 -m pip install -q -r requirements.txt && python3 publish_trend.py
+```
+
+시크릿 값(`BLOGGER_CLIENT_SECRET`, `BLOGGER_TOKEN`)은 절대 로그·커밋·채팅 출력에 남기지
+않습니다. `client_secret.json`, `token.json`, `.blogger_quota_state.json`은 `.gitignore`에
+등록되어 있어 Git에 올라가지 않습니다.
 
 ## publish_trend.py
 
@@ -46,13 +72,19 @@ python backfill_post_images.py  # 이미지 없는 LIVE 글에 헤더 이미지 
   이 자동화는 4시간마다(하루 6회) 실행되므로 기본값 1이면 하루 최대 6개 글을 쓰게 되어,
   "가장 이슈가 되는 것만, 애매하면 줄인다"는 원칙과 잘 맞습니다. API 할당량과는 무관하게
   콘텐츠 품질 기준으로 정하는 값입니다.
-- **`BLOGGER_MAX_NEW_POSTS_PER_DAY` (기본값 50)**: Blogger API의 "신규 글 발행"에 대해
-  통상적으로 알려진(공식 문서화는 아니지만 다년간 다수 개발자가 공통적으로 보고한) 하루 상한
-  추정치입니다. 다만 신생 블로그·신생 앱은 이보다 훨씬 낮은 한도(예: 6개)에서 막히는 경우가
-  흔합니다. 이 값은 상한선 추정치로만 쓰이고, 실제로 403/429를 받거나 오늘 발행 수가 한도에
-  도달하면 **그날은 신규 생성·기존 글 업데이트를 모두 중단**하고 다음 주기로 넘깁니다. 한도
-  소진 여부는 `.blogger_quota_state.json`(Git에 커밋하지 않음)에 KST 날짜 기준으로 기록되어,
-  같은 날 재실행 시 불필요한 재시도를 막아 줍니다.
+- **`BLOGGER_MAX_NEW_POSTS_PER_DAY` (기본값 50)**: Blogger API의 "신규 글 발행"(`posts.insert()`)에
+  대해 통상적으로 알려진(공식 문서화는 아니지만 다년간 다수 개발자가 공통적으로 보고한) 하루
+  상한 추정치입니다. 다만 신생 블로그·신생 앱은 이보다 훨씬 낮은 한도(예: 6개)에서 막히는
+  경우가 흔합니다. 실제로 403/429를 받거나 오늘 발행 수가 한도에 도달하면(`api_blocked`),
+  **그날은 `posts.insert()` 호출을 완전히 중단**하고 다음 주기로 넘깁니다 — 대신 완성된 글은
+  버리지 않고 `pending_posts/`에 저장해 수동 게시로 넘깁니다. 한도 소진 여부는
+  `.blogger_quota_state.json`(Git에 커밋하지 않음)에 KST 날짜 기준으로 기록되어, 같은 날
+  재실행 시 불필요한 재시도를 막아 줍니다.
+  - 단, **아래 "빈 글 인계" 경로(`posts.patch()`)는 이 quota 상태와 무관하게 항상 먼저
+    시도됩니다.** 이 계정은 신규 글 생성 자체가 계정 단위로 차단되어 있어 `posts.insert()`가
+    거의 항상 403이 나므로, 사람이 만들어 둔 빈 LIVE 글을 채우는 patch 경로가 실질적인 주
+    발행 수단입니다. 이 경로를 quota로 막으면 이 블로그는 사실상 아무것도 발행할 수 없게
+    되므로 의도적으로 별도 취급합니다.
 
 Cloud Agent 자동화에서는 `BLOGGER_CLIENT_SECRET` / `BLOGGER_TOKEN` 환경변수(시크릿)로부터
 `client_secret.json` / `token.json`을 만든 뒤 실행합니다.
