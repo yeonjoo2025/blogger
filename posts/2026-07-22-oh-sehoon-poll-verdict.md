@@ -16,7 +16,7 @@
 
 - 방식: posts.insert 403 → 빈 LIVE 글(신규) posts.patch
 - URL: https://yeondodo.blogspot.com/2026/07/blog-post_66.html
-- 썸네일 SHA: 3a5b1b3e49adf454eb2c34212388fac966280a1c
+- 썸네일 SHA: e316a2f9fca1e670f1c10d87a3b85c95ab73133e
 
 ## HTML
 
