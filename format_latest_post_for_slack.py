@@ -84,7 +84,8 @@ def for_naver_paste(plain: str) -> str:
             continue
         out.append(line)
         prev_filler = is_filler
-    return LINE_SEP.join(out).strip()
+    # Confirmed on mobile Slack (2026-07-23): trailing U+2028 + \n keeps breaks.
+    return "\n".join(line + LINE_SEP for line in out).strip()
 
 
 def write_naver_ready_file(plain: str, path: Path) -> Path:
