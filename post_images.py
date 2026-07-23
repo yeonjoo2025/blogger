@@ -347,6 +347,7 @@ def make_thumb_texts(title: str, keyword: str = "", category: str = "") -> tuple
             "건강": "건강에 미치는 영향과 대응 수칙",
             "생활안전": "안전 영향과 대피 요령 정리",
             "법률": "법적 영향과 대응 절차 정리",
+            "스포츠": "경기 결과·일정과 관전 포인트",
         }.get(category, "핵심 이슈와 대응 방법 정리")
     hangul_len = len(re.findall(r"[가-힣]", remainder))
     if hangul_len >= 6 and len(remainder) >= 8:
