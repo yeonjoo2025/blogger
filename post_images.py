@@ -237,6 +237,9 @@ def resolve_scene(keyword: str, title: str = "", category: str = "") -> tuple[
     if category == "법률":
         return (20, 24, 36), (55, 70, 100), (120, 230, 220), "legal", \
             "courthouse pillars abstract solemn blue grey, no people"
+    if category == "스포츠":
+        return (10, 16, 40), (30, 50, 110), (255, 214, 60), "sports", \
+            "cinematic sports stadium night under floodlights, empty field, dramatic broadcast mood, no player faces"
     return top, mid, accent, motif, scene
 
 

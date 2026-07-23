@@ -15,22 +15,18 @@ from dataclasses import dataclass
 
 from trend_sources import NewsRef, TrendItem
 
-# Signals that mean "entertainment / celebrity / sports result / pure gossip"
+# Signals that mean "entertainment / celebrity / pure gossip"
 # -> must be excluded per the editorial rules, even if trending high.
+# Sports is intentionally allowed (see INCLUDE_CATEGORIES["스포츠"]).
 EXCLUDE_TERMS = [
     "배우", "가수", "아이돌", "걸그룹", "보이그룹", "예능", "드라마", "영화배우",
     "컴백", "열애", "결별", "이혼설", "재혼", "임신설", "근황", "화보", "콘서트",
     "팬미팅", "시상식", "데뷔", "스캔들", "저격", "디스전", "유튜버", "인플루언서",
     "틱톡커", "인스타그램", "웹툰", "예능프로", "OTT 예능",
-    "야구", "축구", "농구", "배구", "골프", "올림픽", "월드컵", "국가대표팀",
-    "우승", "준우승", "결승전", "8강", "4강", "감독 선임", "선수단", "홈런",
-    "득점왕", "스코어", "중계", "리그", "KBO", "K리그", "MLB", "NBA", "EPL",
-    "이적설", "트레이드",
 ]
 
-# Real-life / money-impact categories. First matching category (by highest
-# hit count) wins; keyword must have at least one hit in this table to be a
-# candidate at all.
+# Issue categories. First matching category (by highest hit count) wins;
+# keyword must have at least one hit in this table to be a candidate at all.
 INCLUDE_CATEGORIES: dict[str, list[str]] = {
     "금융": [
         "주가", "코스피", "코스닥", "환율", "금리", "기준금리", "대출", "전세",
@@ -61,6 +57,17 @@ INCLUDE_CATEGORIES: dict[str, list[str]] = {
     "법률": [
         "판결", "소송", "기소", "구속", "압수수색", "규제", "법안", "시행",
         "단속", "과징금", "공정위", "세무조사", "국세청", "고발", "항소",
+    ],
+    "스포츠": [
+        "야구", "축구", "농구", "배구", "골프", "테니스", "당구", "탁구", "수영",
+        "육상", "격투기", "복싱", "UFC", "올림픽", "월드컵", "아시안게임",
+        "국가대표", "국가대표팀", "우승", "준우승", "결승", "결승전", "8강", "4강",
+        "홈런", "득점", "스코어", "중계", "리그", "경기", "시합", "시즌",
+        "KBO", "K리그", "MLB", "NBA", "EPL", "프리미어리그", "라리가", "세리에",
+        "챔피언스리그", "이적", "트레이드", "감독", "선수단", "선수", "구단",
+        "토트넘", "손흥민", "메시", "두산", "LG트윈스", "삼성라이온즈",
+        "한화이글스", "기아타이거즈", "SSG", "NC다이노스", "키움", "롯데자이언츠",
+        "KT위즈", "FC", "인터 마이애미", "케스파컵", "e스포츠", "LCK",
     ],
 }
 
@@ -175,7 +182,7 @@ def is_qualified(keyword: str, news: list[NewsRef]) -> tuple[bool, str | None, s
         return False, None, f"net_score={net_score} < {MIN_NET_SCORE} (include={include_hits}, exclude={exclude_hits})"
 
     if exclude_hits > include_hits:
-        return False, None, "entertainment/sports signal dominates"
+        return False, None, "entertainment/gossip signal dominates"
 
     coherence = headline_coherence(keyword, news)
     norm = normalize_keyword(keyword)
