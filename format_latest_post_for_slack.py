@@ -11,11 +11,11 @@ from googleapiclient.discovery import build
 
 from blogger_auth import load_credentials
 
-# Mobile Slack drag-copy → Naver often collapses normal `\n` to spaces.
-# U+2028 Line Separator usually remains in the pasted text and becomes a break.
-# U+3164 Hangul Filler keeps blank paragraph gaps visible/meaningful.
+# Mobile Slack → Naver: normal `\n` often collapses on paste.
+# Confirmed fix: join lines with U+2028 ONLY (never also join with `\n`).
+# See AUTOMATION_PROMPT.md
 LINE_SEP = "\u2028"
-HANGUL_FILLER = "\u3164"
+HANGUL_FILLER = "\u3164"  # legacy cleanup helper only; do not inject into Slack body
 
 
 class BlogTextExtractor(HTMLParser):
