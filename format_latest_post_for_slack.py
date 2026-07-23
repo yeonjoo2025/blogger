@@ -11,7 +11,10 @@ from googleapiclient.discovery import build
 
 from blogger_auth import load_credentials
 
-# Blank paragraphs: Hangul Filler so empty gaps don't vanish in some editors.
+# Mobile Slack drag-copy → Naver often collapses normal `\n` to spaces.
+# U+2028 Line Separator usually remains in the pasted text and becomes a break.
+# U+3164 Hangul Filler keeps blank paragraph gaps visible/meaningful.
+LINE_SEP = "\u2028"
 HANGUL_FILLER = "\u3164"
 
 
@@ -61,15 +64,10 @@ def html_to_text(content: str) -> str:
 
 
 def for_naver_paste(plain: str) -> str:
-    """Normalize plain text for Slack delivery (no mrkdwn / code fences).
+    """Mobile-first Slack payload for Naver Blog paste.
 
-    Important: Slack drag-select copy puts text/html on the clipboard, and
-    Naver SmartEditor prefers that HTML — which often collapses line breaks.
-    Users should copy via Slack's "Copy text" / "텍스트 복사", or paste into
-    Naver with Ctrl+Shift+V (paste without formatting).
-
-    We still keep real newlines + Hangul-filler blank lines so plain-text
-    copy paths preserve paragraph structure.
+    Uses U+2028 between lines (not `\n`) so phone Slack copy → Naver paste
+    keeps breaks even when normal newlines are collapsed to spaces.
     """
     lines: list[str] = []
     for line in plain.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
@@ -77,8 +75,7 @@ def for_naver_paste(plain: str) -> str:
             lines.append(HANGUL_FILLER)
         else:
             lines.append(line.rstrip())
-    # Paragraph spacing: blank filler line between blocks already in source;
-    # collapse runs of fillers to a single filler.
+
     out: list[str] = []
     prev_filler = False
     for line in lines:
@@ -87,20 +84,19 @@ def for_naver_paste(plain: str) -> str:
             continue
         out.append(line)
         prev_filler = is_filler
-    return "\n".join(out).strip()
+    return LINE_SEP.join(out).strip()
 
 
 def write_naver_ready_file(plain: str, path: Path) -> Path:
-    """Write UTF-8 plain text for optional raw-file fallback."""
+    """Write UTF-8 plain text with real newlines (file/raw fallback)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    # File fallback should use real empty lines, not Hangul filler.
-    cleaned = "\n".join(
-        "" if line == HANGUL_FILLER else line for line in plain.split("\n")
-    )
-    # If caller passed already-plain text without fillers, write as-is.
-    if HANGUL_FILLER not in plain:
-        cleaned = plain
-    path.write_text(cleaned.strip() + "\n", encoding="utf-8")
+    text = plain.replace(LINE_SEP, "\n").replace(HANGUL_FILLER, "").strip() + "\n"
+    # Prefer caller-provided real-newline plain files unchanged when possible.
+    if "\n" in plain and LINE_SEP not in plain:
+        text = plain.replace("\r\n", "\n").replace("\r", "\n")
+        if not text.endswith("\n"):
+            text += "\n"
+    path.write_text(text, encoding="utf-8")
     return path
 
 
