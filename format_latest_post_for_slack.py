@@ -8,6 +8,12 @@ from googleapiclient.discovery import build
 
 from blogger_auth import load_credentials
 
+# Slack → Naver Blog paste drops normal `\n` (clipboard HTML collapses breaks).
+# U+2028 Line Separator usually survives as a real line break on paste.
+# U+3164 Hangul Filler keeps blank paragraph gaps from disappearing.
+LINE_SEP = "\u2028"
+HANGUL_FILLER = "\u3164"
+
 
 class BlogTextExtractor(HTMLParser):
     """Convert simple Blogger HTML into readable plain text blocks."""
@@ -54,11 +60,22 @@ def html_to_text(content: str) -> str:
     return parser.text()
 
 
-def casualize_for_naver(title: str, body_text: str, url: str) -> str:
-    """Return plain text wrapped for one-shot Slack copy-paste.
+def for_naver_paste(plain: str) -> str:
+    """Harden plain text so Slack copy → Naver Blog keeps line breaks."""
+    lines: list[str] = []
+    for line in plain.split("\n"):
+        if line.strip() == "":
+            lines.append(HANGUL_FILLER)
+        else:
+            lines.append(line)
+    return LINE_SEP.join(lines)
 
-    Slack rich text / mrkdwn (*bold*, bullets) breaks when pasted into
-    Naver Blog, so the whole payload is a single code fence with plain text.
+
+def casualize_for_naver(title: str, body_text: str, url: str) -> str:
+    """Return Slack text that survives copy-paste into Naver Blog.
+
+    Do not wrap in Slack code fences — mobile/desktop code-block copy often
+    becomes a single line when pasted into Naver SmartEditor.
     """
     intro = (
         "요즘 읽기 좋게 네이버 블로그 톤으로 살짝 풀어봤어요.\n"
@@ -71,8 +88,7 @@ def casualize_for_naver(title: str, body_text: str, url: str) -> str:
     )
     source = f"\n\n참고 링크: {url}" if url else ""
     plain = f"{title}\n\n{intro}\n\n{body_text}\n\n{closing}{source}".strip()
-    # Slack code block preserves line breaks on copy.
-    return f"```\n{plain}\n```"
+    return for_naver_paste(plain)
 
 
 def latest_post(service) -> dict:
