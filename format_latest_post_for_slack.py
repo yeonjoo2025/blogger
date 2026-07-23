@@ -66,26 +66,28 @@ def html_to_text(content: str) -> str:
 def for_naver_paste(plain: str) -> str:
     """Mobile-first Slack payload for Naver Blog paste.
 
-    Uses U+2028 between lines (not `\n`) so phone Slack copy → Naver paste
-    keeps breaks even when normal newlines are collapsed to spaces.
+    Join with U+2028 only (no extra ``\\n``). Phone Slack keeps U+2028 as a
+    real break; pairing it with ``\\n`` made every gap double-spaced.
+    Blank paragraphs are a single empty slot → one blank line, not a filler
+    row plus two breaks.
     """
     lines: list[str] = []
     for line in plain.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         if line.strip() == "":
-            lines.append(HANGUL_FILLER)
+            lines.append("")
         else:
             lines.append(line.rstrip())
 
     out: list[str] = []
-    prev_filler = False
+    prev_blank = False
     for line in lines:
-        is_filler = line == HANGUL_FILLER
-        if is_filler and prev_filler:
+        is_blank = line == ""
+        if is_blank and prev_blank:
             continue
         out.append(line)
-        prev_filler = is_filler
-    # Confirmed on mobile Slack (2026-07-23): trailing U+2028 + \n keeps breaks.
-    return "\n".join(line + LINE_SEP for line in out).strip()
+        prev_blank = is_blank
+    # Confirmed on mobile: U+2028 preserves breaks. Do not also join with \n.
+    return LINE_SEP.join(out).strip()
 
 
 def write_naver_ready_file(plain: str, path: Path) -> Path:
