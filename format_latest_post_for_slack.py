@@ -1,17 +1,17 @@
 """Format the latest Blogger post as a casual Naver-style Slack message."""
 
+from __future__ import annotations
+
 import re
 from html import unescape
 from html.parser import HTMLParser
+from pathlib import Path
 
 from googleapiclient.discovery import build
 
 from blogger_auth import load_credentials
 
-# Slack → Naver Blog paste drops normal `\n` (clipboard HTML collapses breaks).
-# U+2028 Line Separator usually survives as a real line break on paste.
-# U+3164 Hangul Filler keeps blank paragraph gaps from disappearing.
-LINE_SEP = "\u2028"
+# Blank paragraphs: Hangul Filler so empty gaps don't vanish in some editors.
 HANGUL_FILLER = "\u3164"
 
 
@@ -61,22 +61,51 @@ def html_to_text(content: str) -> str:
 
 
 def for_naver_paste(plain: str) -> str:
-    """Harden plain text so Slack copy → Naver Blog keeps line breaks."""
+    """Normalize plain text for Slack delivery (no mrkdwn / code fences).
+
+    Important: Slack drag-select copy puts text/html on the clipboard, and
+    Naver SmartEditor prefers that HTML — which often collapses line breaks.
+    Users should copy via Slack's "Copy text" / "텍스트 복사", or paste into
+    Naver with Ctrl+Shift+V (paste without formatting).
+
+    We still keep real newlines + Hangul-filler blank lines so plain-text
+    copy paths preserve paragraph structure.
+    """
     lines: list[str] = []
-    for line in plain.split("\n"):
+    for line in plain.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         if line.strip() == "":
             lines.append(HANGUL_FILLER)
         else:
-            lines.append(line)
-    return LINE_SEP.join(lines)
+            lines.append(line.rstrip())
+    # Paragraph spacing: blank filler line between blocks already in source;
+    # collapse runs of fillers to a single filler.
+    out: list[str] = []
+    prev_filler = False
+    for line in lines:
+        is_filler = line == HANGUL_FILLER
+        if is_filler and prev_filler:
+            continue
+        out.append(line)
+        prev_filler = is_filler
+    return "\n".join(out).strip()
+
+
+def write_naver_ready_file(plain: str, path: Path) -> Path:
+    """Write UTF-8 plain text for optional raw-file fallback."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # File fallback should use real empty lines, not Hangul filler.
+    cleaned = "\n".join(
+        "" if line == HANGUL_FILLER else line for line in plain.split("\n")
+    )
+    # If caller passed already-plain text without fillers, write as-is.
+    if HANGUL_FILLER not in plain:
+        cleaned = plain
+    path.write_text(cleaned.strip() + "\n", encoding="utf-8")
+    return path
 
 
 def casualize_for_naver(title: str, body_text: str, url: str) -> str:
-    """Return Slack text that survives copy-paste into Naver Blog.
-
-    Do not wrap in Slack code fences — mobile/desktop code-block copy often
-    becomes a single line when pasted into Naver SmartEditor.
-    """
+    """Return Slack body text (title + body + source). No code fences."""
     intro = (
         "요즘 읽기 좋게 네이버 블로그 톤으로 살짝 풀어봤어요.\n"
         "너무 딱딱하지 않게, 편하게 쭉 읽히는 느낌으로 정리했습니다."
