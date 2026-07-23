@@ -5,3 +5,6 @@ client_secret*.json
 token.json
 .env
 .DS_Store
+.blogger_quota_state.json
+pending_posts/
+generated_images/
