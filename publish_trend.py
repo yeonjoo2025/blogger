@@ -80,10 +80,34 @@ from keyword_filter import (
 from trend_sources import KST, TrendItem, collect_all_trends, fetch_related_news
 
 DEDUPE_LOOKBACK_HOURS = 20
+USEFULNESS_DEDUP_HOURS = 24 * 7
+MIN_USEFULNESS_SCORE = 7
 NEWS_PER_CANDIDATE = 15
 NEWS_SHOWN_IN_POST = 6
 QUOTA_STATE_PATH = Path(".blogger_quota_state.json")
 PENDING_DIR = Path("pending_posts")
+
+# Source-family buckets used for pick-tier ranking (blackkiwi/loword first).
+_SOURCE_FAMILY_PREFIXES = (
+    ("blackkiwi", "blackkiwi"),
+    ("loword", "loword"),
+    ("google_trends", "gtrends"),
+)
+_SPORTS_RESULT_MARKERS = (
+    "역전패", "완승", "완패", "연승", "연패", "스코어", "홈런", "득점",
+    "3루타", "2루타", "삼진", "승리의 시구", "시구",
+)
+_OFFICIAL_SOURCE_HINTS = (
+    "go.kr", "korea.kr", "fss.or.kr", "bok.or.kr", "krx.co.kr",
+    "sec.gov", "investor.", "ir.", "alphavantage", "dart.fss.or.kr",
+    "kma.go.kr", "kdca.go.kr", "mfds.go.kr", "moe.go.kr",
+    "nvidia.com", "abc.xyz", "blog.google", "samsung.com",
+    "mlb.com", "kbo.or.kr", "kleague.com",
+)
+_ACTION_INTENT_HINTS = (
+    "방법", "확인", "신청", "예약", "대상", "일정", "발표", "공시", "IR",
+    "체크", "대응", "신청법", "보는 법", "확인하는",
+)
 
 # Editorial cap: how many topics we're willing to write about per run. This
 # is a *content quality* decision ("가장 이슈가 되는 것만 작성, 애매하면
@@ -157,6 +181,155 @@ def score_group(items: list[TrendItem], news_count: int, coherence: float) -> fl
     score += max(0, 15 - best_rank) * 0.5
     score += min(traffic, 20000) / 1000
     return score
+
+
+def source_families(sources: set[str] | None) -> set[str]:
+    """Map raw collector names to blackkiwi / loword / gtrends families."""
+    families: set[str] = set()
+    for raw in sources or set():
+        matched = False
+        for prefix, family in _SOURCE_FAMILY_PREFIXES:
+            if raw.startswith(prefix) or prefix in raw:
+                families.add(family)
+                matched = True
+                break
+        if not matched and raw:
+            families.add(raw)
+    return families
+
+
+def pick_tier(families: set[str]) -> int:
+    """Selection tier: 1=all three, 2=blackkiwi∩loword, 3=either, 4=gtrends-only."""
+    has_bk = "blackkiwi" in families
+    has_lw = "loword" in families
+    has_gt = "gtrends" in families
+    if has_bk and has_lw and has_gt:
+        return 1
+    if has_bk and has_lw:
+        return 2
+    if has_bk or has_lw:
+        return 3
+    if has_gt:
+        return 4
+    return 4
+
+
+def _corpus_text(keyword: str, news: list) -> str:
+    titles = " ".join((getattr(n, "title", "") or "") for n in (news or [])[:8])
+    return f"{keyword} {titles}"
+
+
+def classify_intent(keyword: str, category: str, news: list) -> str:
+    """how-to / explainer / decision / news-only."""
+    text = _corpus_text(keyword, news)
+    if category in ("금융", "생활안전", "법률", "건강") and any(
+        h in text for h in ("신청", "예약", "확인", "방법", "대피", "신고", "접수")
+    ):
+        return "how-to"
+    if is_earnings_topic(keyword, news) or category == "투자":
+        return "decision"
+    if category in ("금융", "법률", "건강") and any(
+        h in text for h in ("제도", "규제", "개정", "시행", "대상", "요건")
+    ):
+        return "explainer"
+    if category == "스포츠" and any(m in text for m in _SPORTS_RESULT_MARKERS):
+        return "news-only"
+    if category == "스포츠":
+        return "decision"
+    if any(h in text for h in _ACTION_INTENT_HINTS):
+        return "how-to"
+    return "news-only"
+
+
+def _has_official_source(keyword: str, category: str, news: list) -> bool:
+    blob = " ".join(
+        f"{getattr(n, 'url', '')} {getattr(n, 'source', '')} {getattr(n, 'title', '')}"
+        for n in (news or [])[:10]
+    ).lower()
+    if any(h in blob for h in _OFFICIAL_SOURCE_HINTS):
+        return True
+    # Category defaults always expose at least one official check path
+    # in the generated article (IR / 금융감독원 / 질병청 등).
+    if category in ("투자", "금융", "건강", "생활안전", "법률"):
+        return True
+    if is_earnings_topic(keyword, news):
+        return True
+    return False
+
+
+def _count_verifiable_facts(news: list) -> int:
+    facts = 0
+    for item in (news or [])[:8]:
+        title = getattr(item, "title", "") or ""
+        if re.search(r"\d", title):
+            facts += 1
+        if any(tok in title for tok in ("발표", "공시", "확정", "시행", "인상", "인하", "연기")):
+            facts += 1
+    return facts
+
+
+def score_usefulness(
+    cand: TopicCandidate,
+    recent_posts: list[dict],
+    now: datetime,
+) -> tuple[int, str, str]:
+    """Return (score 0-10, intent, reason). Hard-skip cases return score 0."""
+    intent = classify_intent(cand.keyword, cand.category, cand.news)
+    reasons: list[str] = [f"intent={intent}"]
+
+    if was_recently_covered(cand.keyword, recent_posts, now, USEFULNESS_DEDUP_HOURS):
+        return 0, intent, "HARD_SKIP: duplicate within 7 days"
+
+    if intent == "news-only" and cand.category != "생활안전":
+        return 0, intent, "HARD_SKIP: news-only without life-safety urgency"
+
+    score = 0
+    # +2 today action
+    if intent in ("how-to", "decision", "explainer") or cand.category in (
+        "투자", "금융", "건강", "생활안전", "법률"
+    ):
+        score += 2
+        reasons.append("+2 today_action")
+    else:
+        return 0, intent, "HARD_SKIP: no concrete today-action"
+
+    # +2 official source
+    if _has_official_source(cand.keyword, cand.category, cand.news):
+        score += 2
+        reasons.append("+2 official_source")
+    else:
+        return 0, intent, "HARD_SKIP: no official source"
+
+    # +2 method/check/target/schedule search intent
+    text = _corpus_text(cand.keyword, cand.news)
+    if any(h in text for h in _ACTION_INTENT_HINTS) or cand.category in (
+        "투자", "금융", "건강", "생활안전", "법률"
+    ):
+        score += 2
+        reasons.append("+2 method_or_schedule_intent")
+
+    # +1 verifiable facts
+    if _count_verifiable_facts(cand.news) >= 3:
+        score += 1
+        reasons.append("+1 verifiable_facts")
+
+    # +1 FAQ potential (structured categories always can)
+    if cand.category in ("투자", "금융", "건강", "생활안전", "법률", "스포츠"):
+        score += 1
+        reasons.append("+1 faq_ready")
+
+    # +1 low 7-day topical overlap (already passed hard skip)
+    score += 1
+    reasons.append("+1 low_7d_overlap")
+
+    # +1 beginner friction point explainable
+    if cand.category in ("투자", "금융", "건강", "생활안전", "법률") or is_earnings_topic(
+        cand.keyword, cand.news
+    ):
+        score += 1
+        reasons.append("+1 beginner_friction")
+
+    return score, intent, ", ".join(reasons)
 
 
 def build_candidates(now: datetime) -> list[TopicCandidate]:
@@ -270,24 +443,56 @@ def select_final_topics(
     now: datetime,
     pending_keywords: set[str] | None = None,
 ) -> list[TopicCandidate]:
-    """Greedily take the strongest candidates, but favor topical diversity:
-    one same-day run should not turn into three near-identical "오늘 미국
-    증시" posts just because that theme happened to dominate the trend
-    feed. Each category gets picked at most once before we allow repeats.
+    """Pick topics by source-tier first, then usefulness, then score.
 
-    A topic is skipped not only when a *live* post already covers it
-    (was_recently_covered), but also when a pending_posts/ draft for it is
-    already waiting on a human to publish manually - otherwise every 4-hour
-    run would keep re-drafting the same still-unpublished topic.
+    Tier order (higher wins; lower tiers ignored when a higher tier exists):
+      1) blackkiwi ∩ loword ∩ gtrends
+      2) blackkiwi ∩ loword
+      3) blackkiwi or loword alone
+      4) gtrends-only (skipped unless 생활안전 emergency)
+
+    Within the winning tier, require USEFULNESS_SCORE >= 7 and keep the
+    strongest non-duplicate topic (default 1 per run).
     """
     pending_keywords = pending_keywords or set()
-    final: list[TopicCandidate] = []
-    used_categories: set[str] = set()
+    if not candidates:
+        return []
 
+    ranked: list[tuple[int, TopicCandidate, set[str]]] = []
     for cand in candidates:
-        if cand.category in used_categories:
+        families = source_families(cand.sources)
+        tier = pick_tier(families)
+        ranked.append((tier, cand, families))
+
+    best_tier = min(t for t, _c, _f in ranked)
+    # Tier-4 (gtrends-only) is non-recommended; only keep 생활안전 exceptions.
+    pool = []
+    for tier, cand, families in ranked:
+        if tier != best_tier:
             continue
-        if any(is_near_duplicate(cand.keyword, f.keyword) for f in final):
+        if tier == 4 and cand.category != "생활안전":
+            log(
+                f"  drop '{cand.keyword}': PICK_TIER=4 gtrends-only "
+                f"(SOURCE_HIT={','.join(sorted(families))})"
+            )
+            continue
+        pool.append((tier, cand, families))
+
+    if not pool and best_tier == 4:
+        log("no non-gtrends topic qualified - publishing nothing this run")
+        return []
+
+    # Sort by usefulness then trend score inside the chosen tier.
+    scored_pool: list[tuple[int, float, TopicCandidate, set[str], str, str]] = []
+    for tier, cand, families in pool:
+        u_score, intent, reason = score_usefulness(cand, recent_posts, now)
+        hit = ",".join(sorted(families)) or "unknown"
+        log(
+            f"  evaluate '{cand.keyword}': SOURCE_HIT={hit} PICK_TIER={tier} "
+            f"INTENT={intent} USEFULNESS_SCORE={u_score} USEFULNESS_REASON={reason}"
+        )
+        if u_score < MIN_USEFULNESS_SCORE:
+            log(f"SKIP_LOW_USEFULNESS: {cand.keyword} score={u_score}")
             continue
         if was_recently_covered(cand.keyword, recent_posts, now, DEDUPE_LOOKBACK_HOURS):
             log(f"  drop '{cand.keyword}': already covered by a recent post")
@@ -295,25 +500,27 @@ def select_final_topics(
         if _is_duplicate_of_pending(cand.keyword, pending_keywords):
             log(f"  drop '{cand.keyword}': already waiting as a pending draft")
             continue
-        final.append(cand)
-        used_categories.add(cand.category)
-        if len(final) >= MAX_POSTS_PER_RUN:
-            return final
+        scored_pool.append((u_score, cand.score, cand, families, intent, reason))
 
-    # Not enough distinct categories qualified - allow repeats to fill up
-    # to MAX_POSTS_PER_RUN rather than leaving obviously good topics unused.
-    for cand in candidates:
-        if len(final) >= MAX_POSTS_PER_RUN:
-            break
-        if any(cand.keyword == f.keyword for f in final):
+    scored_pool.sort(key=lambda row: (-row[0], -row[1]))
+
+    final: list[TopicCandidate] = []
+    used_categories: set[str] = set()
+    for u_score, _trend_score, cand, families, intent, reason in scored_pool:
+        if cand.category in used_categories and len(final) > 0:
             continue
         if any(is_near_duplicate(cand.keyword, f.keyword) for f in final):
             continue
-        if was_recently_covered(cand.keyword, recent_posts, now, DEDUPE_LOOKBACK_HOURS):
-            continue
-        if _is_duplicate_of_pending(cand.keyword, pending_keywords):
-            continue
+        hit = ",".join(sorted(families)) or "unknown"
+        tier = pick_tier(families)
+        log(
+            f"PICK_KEYWORD={cand.keyword} PICK_TIER={tier} SOURCE_HIT={hit} "
+            f"INTENT={intent} USEFULNESS_SCORE={u_score} USEFULNESS_REASON={reason}"
+        )
         final.append(cand)
+        used_categories.add(cand.category)
+        if len(final) >= MAX_POSTS_PER_RUN:
+            break
 
     return final
 
