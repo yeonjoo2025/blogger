@@ -55,6 +55,11 @@ def html_to_text(content: str) -> str:
 
 
 def casualize_for_naver(title: str, body_text: str, url: str) -> str:
+    """Return plain text wrapped for one-shot Slack copy-paste.
+
+    Slack rich text / mrkdwn (*bold*, bullets) breaks when pasted into
+    Naver Blog, so the whole payload is a single code fence with plain text.
+    """
     intro = (
         "요즘 읽기 좋게 네이버 블로그 톤으로 살짝 풀어봤어요.\n"
         "너무 딱딱하지 않게, 편하게 쭉 읽히는 느낌으로 정리했습니다."
@@ -64,8 +69,10 @@ def casualize_for_naver(title: str, body_text: str, url: str) -> str:
         "가볍게 잡아보는 거예요. 필요하면 이 글을 바탕으로 더 짧은 카드뉴스 톤이나 "
         "검색 유입용 제목으로도 다시 다듬을 수 있습니다."
     )
-    source = f"\n\n원문 확인: {url}" if url else ""
-    return f"*{title}*\n\n{intro}\n\n{body_text}\n\n{closing}{source}".strip()
+    source = f"\n\n참고 링크: {url}" if url else ""
+    plain = f"{title}\n\n{intro}\n\n{body_text}\n\n{closing}{source}".strip()
+    # Slack code block preserves line breaks on copy.
+    return f"```\n{plain}\n```"
 
 
 def latest_post(service) -> dict:
