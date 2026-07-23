@@ -210,11 +210,82 @@ def group_trend_items(items: list[TrendItem]) -> dict[str, list[TrendItem]]:
     return groups
 
 
+# Entity alias groups: same company/org under different surface forms.
+# Matching is case-insensitive after normalize_keyword (whitespace stripped).
+ENTITY_ALIAS_GROUPS: list[set[str]] = [
+    {"구글", "알파벳", "google", "alphabet", "googl", "goog"},
+    {"테슬라", "tesla", "tsla"},
+    {"삼성전자", "삼성", "samsung", "005930"},
+    {"마이크론", "micron", "mu"},
+    {"애플", "apple", "aapl"},
+    {"엔비디아", "nvidia", "nvda"},
+    {"마이크로소프트", "microsoft", "msft"},
+    {"메타", "meta", "페이스북", "facebook", "metaplatforms"},
+    {"아마존", "amazon", "amzn"},
+    {"넷플릭스", "netflix", "nflx"},
+]
+
+# Topic/event alias groups: same issue under different wording.
+TOPIC_ALIAS_GROUPS: list[set[str]] = [
+    {
+        "실적발표", "실적", "어닝스", "분기실적", "가이던스", "컨센서스",
+        "earnings", "어닝", "실적시즌", "분기실", "영업익", "영업이익", "eps", "매출",
+    },
+    {"금리", "기준금리", "이자율", "fed", "fomc"},
+    {"관세", "tariff", "무역장벽"},
+    {"근저당", "근저당권"},
+    {"회생", "회생절차", "기업회생", "워크아웃"},
+]
+
+
+def _lower_norm(text: str) -> str:
+    return normalize_keyword(text).lower()
+
+
+def _matched_alias_groups(text: str, groups: list[set[str]]) -> set[int]:
+    """Return indices of alias groups whose any member appears in text.
+
+    Prefer longer aliases first so '실적발표' wins over bare '실적', and
+    '삼성전자' wins over '삼성'.
+    """
+    hay = _lower_norm(text)
+    if not hay:
+        return set()
+    matched: set[int] = set()
+    for idx, group in enumerate(groups):
+        for alias in sorted(group, key=len, reverse=True):
+            a = alias.lower().replace(" ", "")
+            if a and a in hay:
+                matched.add(idx)
+                break
+    return matched
+
+
 def is_near_duplicate(a: str, b: str) -> bool:
+    """True when two titles/keywords refer to the same issue.
+
+    Rules (stronger than substring-only):
+    1) Exact / substring match on normalized text (legacy).
+    2) Same entity-alias group AND same topic-alias group both hit
+       in each side → treat as the same issue even if wording differs
+       (e.g. "구글 실적발표" ≈ "구글(알파벳) Q2 실적 전 ...").
+    Same entity with a different topic (실적 vs 제미나이 출시) is NOT
+    a duplicate; same topic with a different entity (구글 실적 vs
+    마이크론 실적) is also NOT a duplicate.
+    """
     na, nb = normalize_keyword(a), normalize_keyword(b)
     if not na or not nb:
         return False
     if na == nb:
         return True
     shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
-    return len(shorter) >= 2 and shorter in longer
+    if len(shorter) >= 2 and shorter in longer:
+        return True
+
+    ent_a = _matched_alias_groups(a, ENTITY_ALIAS_GROUPS)
+    ent_b = _matched_alias_groups(b, ENTITY_ALIAS_GROUPS)
+    topic_a = _matched_alias_groups(a, TOPIC_ALIAS_GROUPS)
+    topic_b = _matched_alias_groups(b, TOPIC_ALIAS_GROUPS)
+    if ent_a and ent_b and (ent_a & ent_b) and topic_a and topic_b and (topic_a & topic_b):
+        return True
+    return False

@@ -230,7 +230,15 @@ def list_all_live_posts(service, blog_id: str, max_pages: int = 15) -> list[dict
 
 
 def was_recently_covered(keyword: str, recent_posts: list[dict], now: datetime, hours: int) -> bool:
+    """True when a recent live post already covers the same issue.
+
+    Uses strong near-duplicate matching (entity alias + topic alias), not
+    just substring equality, so titles that rephrase the same event are
+    treated as already covered.
+    """
     norm_kw = normalize_keyword(keyword)
+    if not norm_kw:
+        return False
     cutoff = now - timedelta(hours=hours)
     for post in recent_posts:
         published = post.get("published")
@@ -243,8 +251,11 @@ def was_recently_covered(keyword: str, recent_posts: list[dict], now: datetime, 
         if pub_dt < cutoff:
             continue
         title = post.get("title", "")
-        norm_title = normalize_keyword(title)
-        if norm_kw and (norm_kw in norm_title or is_near_duplicate(keyword, title)):
+        if is_near_duplicate(keyword, title):
+            log(
+                f"  already covered: keyword={keyword!r} ≈ recent title={title!r} "
+                f"(published={published})"
+            )
             return True
     return False
 
