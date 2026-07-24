@@ -1,0 +1,877 @@
+"""Turn a qualified trend keyword + real news into a structured post.
+
+The required structure (issue / who is affected / how to check / how to
+respond / related news) is always rendered, and every factual claim in the
+"issue" and "related news" sections is grounded in real headlines pulled
+from Google News RSS rather than invented.
+
+Body length is intentionally substantial: each section expands into
+concrete paragraphs + checklists so a reader can act on the issue without
+leaving the page for basic context.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from html import escape
+
+from keyword_filter import is_earnings_topic
+from trend_sources import NewsRef
+
+# Each category has several distinct title phrasings (not just one fixed
+# template) so that two unrelated topics in the same category don't end up
+# with mechanically identical titles. build_title() picks one deterministically
+# per keyword (stable across runs) and, when a concrete fact (a number,
+# percentage, amount, or date) can be pulled from the real headlines, weaves
+# it in so the title reflects *this* topic's content rather than a generic
+# category label.
+CATEGORY_TITLE_TEMPLATES: dict[str, list[str]] = {
+    "금융": [
+        "{keyword}{angle}, 무슨 일이길래? 지갑에 영향, 확인·대응법 정리",
+        "{keyword}{angle} 이슈 정리 - 내 지갑에 미치는 영향과 대응 체크리스트",
+        "{keyword}{angle}, 대출·세금에 영향 있나? 확인 방법과 대응법",
+    ],
+    "투자": [
+        "{keyword}{angle}, 무슨 일이길래? 투자자 영향과 대응 전략 정리",
+        "{keyword}{angle} 이슈, 내 포트폴리오에 미치는 영향과 대응 전략",
+        "{keyword}{angle} 급등락 배경과 투자자가 지금 확인할 것들",
+    ],
+    "건강": [
+        "{keyword}{angle}, 무슨 일이길래? 건강 영향과 대응 수칙 정리",
+        "{keyword}{angle} 확산 - 증상·리콜 확인법과 대응 수칙",
+        "{keyword}{angle}, 우리 가족은 안전할까? 확인법과 대응 수칙",
+    ],
+    "생활안전": [
+        "{keyword}{angle}, 무슨 일이길래? 안전 영향과 대피·대응 방법 정리",
+        "{keyword}{angle} 발생 - 우리 동네 영향 확인법과 대피 요령",
+        "{keyword}{angle}, 지금 확인해야 할 안전 수칙과 대응 방법",
+    ],
+    "법률": [
+        "{keyword}{angle}, 무슨 일이길래? 법적 영향과 대응 방법 정리",
+        "{keyword}{angle} 이슈, 나에게도 영향 있을까? 확인법과 대응 절차",
+        "{keyword}{angle}, 소송·규제 핵심 정리와 대응 체크리스트",
+    ],
+    "스포츠": [
+        "{keyword}{angle}, 무슨 일이길래? 경기 핵심과 관전 포인트 정리",
+        "{keyword}{angle} 결과·일정 정리 - 팬이 지금 확인할 것들",
+        "{keyword}{angle}, 스코어·일정·선수 이슈 한눈에 보는 법",
+    ],
+}
+
+# Earnings searches are about schedule + numbers, not generic "loan/tax" finance.
+_EARNINGS_TITLE_TEMPLATES = [
+    "{keyword}{angle}, 일정·실적 핵심과 확인 포인트 정리",
+    "{keyword}{angle} 언제·얼마? 발표 일정과 실적 포인트",
+    "{keyword}{angle}, 실적 숫자·관전 포인트와 대응 체크리스트",
+]
+_DEFAULT_TITLE_TEMPLATES = [
+    "{keyword}{angle}, 무슨 일이길래? 핵심 요약과 대응법 정리",
+    "{keyword}{angle} 이슈, 지금 확인해야 할 영향과 대응법",
+]
+
+# Concrete, real facts worth surfacing in a title: percentages, amounts,
+# counts, dates - things that make a headline feel like *this specific*
+# event rather than a generic template fill-in.
+_ANGLE_RE = re.compile(
+    r"(?:\d+\s*분기|"
+    r"\d+\s*월\s*\d+\s*일|"
+    r"\d+(?:[.,]\d+)?\s*(?:%|퍼센트|배|만\s?원|억\s?원|조\s?원|만\s?명|명|건|개월|일|년|월))"
+)
+_SCHEDULE_RE = re.compile(
+    r"(?:\d+\s*월\s*\d+\s*일|\d+\s*분기|오늘|내일|D-\d+|발표\s*임박|실적\s*발표\s*앞두고)"
+)
+_FOCUS_TERMS = (
+    "AI", "인공지능", "클라우드", "데이터센터", "광고", "유튜브", "검색",
+    "가이던스", "컨센서스", "EPS", "매출", "영업이익", "반도체",
+)
+
+CATEGORY_ISSUE_CONTEXT = {
+    "금융": (
+        "금융·경제 이슈는 뉴스 헤드라인만 보고 넘기기 쉽지만, 실제로는 대출 이자, "
+        "세금 납부, 지원금 신청, 보험·연금 수령처럼 가계 현금흐름에 바로 연결되는 "
+        "경우가 많습니다. 따라서 ‘무슨 일이 생겼는지’와 함께 ‘내 계약·계좌·신청 "
+        "일정에 어떤 변화가 있는지’를 같이 확인하는 편이 안전합니다."
+    ),
+    "투자": (
+        "투자 관련 검색이 급증할 때는 단기 시세 변동뿐 아니라 공시, 실적, 규제, "
+        "수급 변화가 겹치는 경우가 많습니다. 특정 종목·코인·지수가 언급되더라도 "
+        "단정적인 매수/매도 신호로 보지 말고, 본인 포트폴리오의 비중과 리스크 "
+        "한도 안에서 사실관계를 재확인하는 접근이 필요합니다."
+    ),
+    "건강": (
+        "건강·의료 이슈는 검색량이 빠르게 늘수록 확인되지 않은 정보가 함께 "
+        "퍼질 위험이 큽니다. 증상, 리콜, 감염, 부작용처럼 신체와 직결된 주제는 "
+        "커뮤니티 후기보다 질병관리청·식약처·의료기관의 공식 안내를 우선해 "
+        "확인하는 것이 중요합니다."
+    ),
+    "생활안전": (
+        "생활안전 이슈는 시간과의 싸움입니다. 호우, 화재, 정전, 대피 권고처럼 "
+        "상황 변화가 빠른 주제는 ‘지금 내 지역에 해당하는지’, ‘외출·이동을 "
+        "멈춰야 하는지’, ‘가족·동료에게 공유해야 할 내용은 무엇인지’를 우선적으로 "
+        "점검해야 합니다."
+    ),
+    "법률": (
+        "법률·규제 이슈는 당사자뿐 아니라 비슷한 계약·거래를 앞둔 사람까지 "
+        "영향을 받을 수 있습니다. 판결, 기소, 법 개정, 과징금 뉴스가 나오면 "
+        "감정적 해석보다 적용 범위, 시행 시기, 이의신청·항소 기한 같은 절차적 "
+        "포인트를 먼저 확인하는 것이 실질적인 대응입니다."
+    ),
+    "스포츠": (
+        "스포츠 이슈는 경기 결과뿐 아니라 일정, 중계, 선수 상태, 티켓·좌석, "
+        "응원 일정까지 한번에 검색되는 경우가 많습니다. 감정적 하이라이트만 "
+        "쫓기보다 ‘무슨 경기가 있었는지’, ‘다음에 언제 보는지’, ‘공식 발표와 "
+        "스코어가 무엇인지’를 먼저 정리하는 편이 실용적입니다."
+    ),
+}
+
+CATEGORY_IMPACT_INTRO = {
+    "금융": (
+        "이번 이슈는 대출, 세금, 연금, 물가, 지원금처럼 개인·가계의 지출과 "
+        "자산 관리에 직접 영향을 줄 수 있는 사안입니다. 영향이 바로 나타나지 "
+        "않더라도, 금리·한도·납부 일정·자격 요건이 바뀌면 몇 주 안에 통장과 "
+        "고지서로 이어질 수 있습니다."
+    ),
+    "투자": (
+        "이번 이슈는 국내외 증시·환율·코인 시장에 노출된 투자자의 포트폴리오에 "
+        "직접 영향을 줄 수 있는 사안입니다. 특히 변동성이 큰 구간에서는 "
+        "보유 비중이 큰 자산일수록 손익 폭이 커지므로, 뉴스의 ‘방향’보다 "
+        "본인 계좌의 ‘노출도’를 먼저 점검하는 것이 중요합니다."
+    ),
+    "건강": (
+        "이번 이슈는 감염, 부작용, 리콜, 진료·접종처럼 실제 건강과 대처가 "
+        "필요한 상황과 연결된 사안입니다. 본인뿐 아니라 함께 거주하는 가족, "
+        "어린이·고령자·기저질환자 등 고위험군까지 영향을 받을 수 있습니다."
+    ),
+    "생활안전": (
+        "이번 이슈는 침수, 화재, 대피, 정전, 교통 통제처럼 실제 생활 안전과 "
+        "직결되는 사안입니다. 피해는 거주 지역, 이동 경로, 지하공간 이용 "
+        "여부, 차량 주차 위치에 따라 크게 달라질 수 있습니다."
+    ),
+    "법률": (
+        "이번 이슈는 소송, 규제, 단속, 과징금, 계약 해석처럼 개인·기업이 "
+        "실제로 대응해야 하는 법적 절차와 관련된 사안입니다. 직접 당사자가 "
+        "아니더라도 동일·유사 거래 조건이라면 간접 영향이 생길 수 있습니다."
+    ),
+    "스포츠": (
+        "이번 이슈는 경기 결과, 일정 변경, 선수·감독 동향, 중계권·티켓처럼 "
+        "팬과 참관객의 일정·관심사에 바로 연결되는 사안입니다. 스코어만 보고 "
+        "끝내기보다 다음 경기와 공식 발표를 같이 확인하는 것이 좋습니다."
+    ),
+}
+
+CATEGORY_WHO_AFFECTED = {
+    "금융": [
+        "대출·전세·매매 등 부동산 관련 자금 계획이 있는 사람",
+        "변동금리 대출, 카드 할부, 보험료 갱신을 앞둔 사람",
+        "세금·연금·지원금 신청 일정이 있는 사람",
+        "관련 산업 종사자 및 가격 변동에 민감한 소비자",
+    ],
+    "투자": [
+        "관련 종목·코인을 보유했거나 매수를 검토 중인 투자자",
+        "국내 증시·환율·미국 지수 변동에 자산이 노출된 사람",
+        "퇴직연금·ISA 등 간접투자 상품으로 동일 테마를 보유한 사람",
+        "관련 산업(제조·수출·반도체·에너지 등) 종사자",
+    ],
+    "건강": [
+        "관련 증상이 있거나 의심되는 사람",
+        "리콜·부작용 대상 제품·의약품을 사용 중인 사람",
+        "어린이, 고령자, 임산부, 기저질환자 등 고위험군과 그 보호자",
+        "의료기관·약국·돌봄시설을 자주 이용하는 사람",
+    ],
+    "생활안전": [
+        "해당 지역 거주자 및 통근·통학하는 사람",
+        "차량·대중교통·물류 이동이 필요한 사람",
+        "저지대·하천·지하주차장·반지하 거주자",
+        "어린이·고령자와 함께 거주하거나 돌보는 사람",
+    ],
+    "법률": [
+        "직접 당사자 또는 관련 계약·거래 당사자",
+        "동일·유사 사안으로 분쟁 중이거나 협상을 앞둔 사람",
+        "관련 제도 변경으로 신고·신청 절차가 바뀌는 일반 이용자",
+        "직원·고객 응대가 필요한 사업자·담당자",
+    ],
+    "스포츠": [
+        "해당 팀·선수·리그를 응원하는 팬",
+        "경기 직관·티켓·중계 일정이 있는 사람",
+        "스포츠 베팅·판타지·응원 콘텐츠를 준비하는 사람",
+        "다음 경기 일정에 맞춰 이동·모임 계획을 잡는 사람",
+    ],
+}
+
+CATEGORY_IMPACT_DETAIL = {
+    "금융": [
+        "대출 이자나 상환 부담이 늘면 생활비·저축 여력이 동시에 줄어들 수 있습니다.",
+        "세금·지원금 일정이 바뀌면 신청 누락이나 가산세 위험이 생길 수 있습니다.",
+        "가격·요금 인상 이슈는 당장 체감이 작아도 월간 고정비로 누적됩니다.",
+    ],
+    "투자": [
+        "해외 지수·환율이 흔들리면 국내 보유 자산의 평가액도 같이 움직일 수 있습니다.",
+        "테마성 급등락 구간에서는 유동성이 얇아져 원하는 가격에 체결이 어려울 수 있습니다.",
+        "공시·실적·규제 뉴스가 겹치면 단기 변동폭이 평소보다 커질 수 있습니다.",
+    ],
+    "건강": [
+        "초기 증상을 방치하면 치료 시점과 비용 부담이 커질 수 있습니다.",
+        "리콜 대상 제품은 사용을 계속할수록 위험이 누적됩니다.",
+        "잘못된 민간요법은 오히려 상태를 악화시킬 수 있습니다.",
+    ],
+    "생활안전": [
+        "특보·경보 발효 중 이동은 교통사고·고립·침수 위험을 키웁니다.",
+        "지하공간·하천 주변은 수위가 급격히 올라 대피 시간이 짧아질 수 있습니다.",
+        "정전·단수 시 통신·의료기기·냉장식품 보관에도 2차 피해가 생길 수 있습니다.",
+    ],
+    "법률": [
+        "대응 기한을 놓치면 권리 행사가 제한될 수 있습니다.",
+        "증거자료가 없으면 사실관계를 나중에 입증하기 어려워집니다.",
+        "계약서 문구와 실제 집행이 다르면 추가 분쟁으로 이어질 수 있습니다.",
+    ],
+    "스포츠": [
+        "경기 결과·순위 변동은 다음 경기 티켓·중계 관심으로 바로 이어집니다.",
+        "우천 취소·일정 변경이 있으면 직관·모임 계획이 한꺼번에 흔들릴 수 있습니다.",
+        "선수 부상·이적 소식은 시즌 전망과 응원 콘텐츠 흐름을 바꿉니다.",
+    ],
+}
+
+CATEGORY_CHECK = {
+    "금융": [
+        "한국은행 경제통계시스템(ECOS), 금융위원회·금융감독원 보도자료에서 공식 수치와 시행 시점을 확인합니다.",
+        "거래 중인 은행·카드사·보험사 앱/홈페이지 공지에서 금리, 한도, 수수료 변경 여부를 확인합니다.",
+        "국세청 홈택스·정부24에서 본인에게 적용되는 신고·납부·지원금 일정을 확인합니다.",
+        "본인 대출 계약서의 금리 유형(고정/변동), 만기, 중도상환 조건을 다시 읽어 둡니다.",
+        "가족·공동명의 계좌가 있다면 각자 받는 문자·앱 알림도 함께 점검합니다.",
+    ],
+    "투자": [
+        "한국거래소(KRX) 공시, 관련 종목 IR 자료, 거래소·감독 기관 안내를 확인합니다.",
+        "증권사 리서치와 나스닥·코스피·환율 등 비교 지수의 당일 변동을 함께 봅니다.",
+        "가상자산이라면 거래소 공지, 입출금 중단 여부, 네트워크 이슈를 확인합니다.",
+        "본인 계좌의 평가손익, 비중, 예약주문 상태를 앱에서 직접 재확인합니다.",
+        "같은 테마를 담은 ETF·펀드가 있다면 구성 종목과 괴리율도 점검합니다.",
+    ],
+    "건강": [
+        "질병관리청·보건소 공식 발표와 통계로 유행 여부와 예방 수칙을 확인합니다.",
+        "식품의약품안전처 리콜·회수 정보에서 제품명, 제조번호, 조치 방법을 확인합니다.",
+        "증상·복용약·접종력이 있다면 이용 중인 의료기관·약국에 구체적으로 문의합니다.",
+        "공식 안내 이전의 SNS·커뮤니티 정보는 참고용으로만 두고 단정하지 않습니다.",
+        "가정 내 고위험군이 있다면 진료·검사 우선순위를 미리 정해 둡니다.",
+    ],
+    "생활안전": [
+        "기상청 특보와 행정안전부 안전디딤돌 앱에서 우리 동네 경보 단계를 확인합니다.",
+        "지자체·소방서·경찰서의 재난문자와 대피소·통제 구간 공지를 확인합니다.",
+        "거주 지역 침수·정전·교통 상황을 실시간 뉴스와 지도 앱으로 교차 확인합니다.",
+        "출근·통학·택배 등 이동이 필요하면 우회 경로와 대체 일정을 미리 잡습니다.",
+        "지하주차장, 반지하, 하천 주변 시설은 이용 전 안전을 다시 확인합니다.",
+    ],
+    "법률": [
+        "국가법령정보센터에서 관련 법령·개정안·시행일을 확인합니다.",
+        "관할 법원·관계 기관 보도자료와 공고문으로 적용 대상과 절차를 확인합니다.",
+        "대한법률구조공단·지자체 법률상담 창구 등 무료 상담 채널을 확인합니다.",
+        "계약서, 영수증, 문자, 녹취, 이메일 등 증거자료를 날짜별로 모아 둡니다.",
+        "이의신청·항소·신고 기한이 있다면 캘린더에 마감일을 표시합니다.",
+    ],
+    "스포츠": [
+        "리그·구단 공식 사이트와 협회 발표에서 스코어·일정·라인업을 확인합니다.",
+        "중계 채널·스트리밍 일정과 우천·연기 공지를 함께 봅니다.",
+        "티켓·좌석·입장 안내가 있다면 구단·티켓 플랫폼 공지를 재확인합니다.",
+        "선수 부상·출전 여부·감독 코멘트는 공식 기자회견·구단 SNS를 우선합니다.",
+        "다음 경기 일정과 상대 전적을 캘린더에 표시해 둡니다.",
+    ],
+}
+
+CATEGORY_RESPONSE = {
+    "금융": [
+        "대출 금리·만기, 세금 신고 기한, 자동이체일을 캘린더에 등록합니다.",
+        "가계부 기준으로 고정비·변동비를 다시 나누고 당장 줄일 항목을 정합니다.",
+        "필요하면 은행·세무 전문가와 상담해 본인 상황에 맞는 상환·절세 옵션을 확인합니다.",
+        "공식 발표 이전의 추측성 정보로 중도상환·해약·추가대출을 서두르지 않습니다.",
+        "가족 공동 지출이 있다면 변경된 조건을 공유하고 역할을 나눕니다.",
+    ],
+    "투자": [
+        "단기 급등락에 즉흥 매매하지 않고, 사전에 정한 투자 원칙과 손절·익절 기준을 따릅니다.",
+        "보유 종목·코인의 비중과 현금 비중을 다시 계산해 과다 노출을 줄입니다.",
+        "추가 매수 전이라면 분할 매수·관망 등 속도를 낮추는 방법을 우선 검토합니다.",
+        "관련 공시·후속 뉴스를 2~3일간 추적하며 판단 근거를 업데이트합니다.",
+        "레버리지·미수·신용 사용 중이라면 강제청산 위험을 먼저 점검합니다.",
+    ],
+    "건강": [
+        "의심 증상이 있으면 자가진단·민간요법보다 의료기관 진료를 우선합니다.",
+        "리콜·회수 대상 제품이나 의약품은 즉시 사용을 중단하고 안내된 절차를 따릅니다.",
+        "손 씻기, 환기, 마스크, 예방접종 등 기본 수칙을 생활화합니다.",
+        "복용 중인 약이 있다면 임의로 중단하지 말고 의료진과 상의합니다.",
+        "가족·직장 공유 공간이 있다면 전파 가능성을 기준으로 동선을 조정합니다.",
+    ],
+    "생활안전": [
+        "특보·경보 발효 지역은 외출을 자제하고, 안내된 안전한 장소로 이동합니다.",
+        "침수 위험이 있는 지하공간·차량 이동·하천 접근을 피합니다.",
+        "손전등, 보조배터리, 상비약, 비상식량, 중요 서류 사본을 미리 준비합니다.",
+        "가족 연락망과 만날 장소를 정해 두고, 어린이·고령자 위치를 수시로 확인합니다.",
+        "상황이 소강돼도 통제가 해제됐는지 공식 안내를 보고 복귀합니다.",
+    ],
+    "법률": [
+        "계약서, 문자, 영수증, 입금내역 등 증거자료를 원본과 사본으로 보관합니다.",
+        "이의신청·항소·신고 기한을 놓치지 않도록 마감일을 기준으로 역산해 일정을 짭니다.",
+        "상대방과 추가 합의·대화를 할 때도 내용을 기록으로 남깁니다.",
+        "필요하면 변호사·법률구조공단 상담을 통해 다음 절차를 확인합니다.",
+        "공식 문서에 없는 구두 약속을 전제로 중요한 결정을 내리지 않습니다.",
+    ],
+    "스포츠": [
+        "최종 스코어·순위는 공식 기록으로 확인하고 하이라이트만으로 단정하지 않습니다.",
+        "직관·모임이 있다면 우천·일정 변경 알림을 켜 두고 대체 일정을 마련합니다.",
+        "중계·티켓 정보는 공식 채널 기준으로 공유하고 출처 불명 루머는 걸러 둡니다.",
+        "다음 경기 상대·선발·중계 시간을 메모해 응원·콘텐츠 준비를 정리합니다.",
+        "선수 이적·계약 루머는 구단·에이전트 공식 발표 전까지 확정으로 보지 않습니다.",
+    ],
+}
+
+CATEGORY_MISTAKES = {
+    "금융": [
+        "커뮤니티의 ‘곧 인하/인상된다’는 소문만 믿고 계약을 성급히 바꾸는 것",
+        "본인 대출·세금 일정을 확인하지 않은 채 평균적인 사례만 따라 하는 것",
+        "수수료·중도상환 위약금을 계산하지 않고 상품을 옮기는 것",
+    ],
+    "투자": [
+        "헤드라인만 보고 전량 매수·전량 매도하는 것",
+        "중복 테마 상품을 여러 개 사 두고도 위험을 분산했다고 착각하는 것",
+        "거래정지·입출금 점검 공지를 확인하지 않은 채 주문하는 것",
+    ],
+    "건강": [
+        "검증되지 않은 약·식품을 추가로 섭취하는 것",
+        "증상이 가벼운 초기 검사를 미루다 전파·악화를 키우는 것",
+        "리콜 공지의 제조번호와 다른데도 막연히 불안해 모두 폐기하는 것(또는 그 반대)",
+    ],
+    "생활안전": [
+        "‘우리 동네는 아직 괜찮다’는 느낌만으로 특보를 무시하는 것",
+        "침수된 도로·지하차도에 차량으로 진입하는 것",
+        "정전 중 엘리베이터·지하공간을 이용하는 것",
+    ],
+    "법률": [
+        "감정적 대응으로 증거에 불리한 메시지를 보내는 것",
+        "기한 계산을 영업일/달력일로 혼동하는 것",
+        "합의서·각서 내용을 충분히 읽지 않고 서명하는 것",
+    ],
+    "스포츠": [
+        "확인되지 않은 스코어·라인업 루머를 사실처럼 공유하는 것",
+        "우천·연기 공지를 보지 않고 경기장·모임에 그대로 가는 것",
+        "선수 이적·부상 루머만 믿고 다음 일정을 확정하는 것",
+    ],
+}
+
+CATEGORY_FAQ = {
+    "금융": [
+        (
+            "당장 통장에서 돈이 나가지 않아도 확인해야 하나요?",
+            "네. 금리·세금·지원금 변경은 고지와 실제 출금 사이에 시차가 있는 경우가 많습니다. "
+            "미리 일정을 확인해야 연체·가산세·신청 누락을 줄일 수 있습니다.",
+        ),
+        (
+            "어디에 문의하는 게 가장 빠를까요?",
+            "이미 거래 중인 금융사 앱 채팅·콜센터와 홈택스·정부24 안내가 1차 창구입니다. "
+            "제도 전반이 궁금하면 금융감독원·국세청 공식 설명자료를 함께 보세요.",
+        ),
+    ],
+    "투자": [
+        (
+            "뉴스가 부정적이면 바로 파는 게 맞나요?",
+            "반드시 그렇지는 않습니다. 본인 비중, 투자 기간, 손절 기준이 더 중요합니다. "
+            "즉흥 매도보다 사실 확인과 리스크 한도 점검이 우선입니다.",
+        ),
+        (
+            "해외 이슈인데 국내 계좌도 봐야 하나요?",
+            "네. 환율, 원자재, 미국 지수 변동은 국내 종목과 펀드 평가액에 바로 반영될 수 있습니다.",
+        ),
+    ],
+    "건강": [
+        (
+            "검색으로 증상을 자가진단해도 될까요?",
+            "초기 참고만 가능합니다. 최종 판단은 의료진에게 맡기고, 고열·호흡곤란·심한 통증처럼 "
+            "급격한 변화가 있으면 지체 없이 진료받으세요.",
+        ),
+        (
+            "리콜 공지가 나오면 어떻게 하나요?",
+            "제품명과 제조번호를 대조한 뒤 사용을 중단하고, 판매처·제조사·식약처가 안내한 "
+            "교환·환불·폐기 절차를 따르면 됩니다.",
+        ),
+    ],
+    "생활안전": [
+        (
+            "특보가 우리 동까지는 아닌 것 같은데 외출해도 될까요?",
+            "인접 지역 특보도 이동 경로에 영향을 줄 수 있습니다. 출발 전 기상청·지자체 공지와 "
+            "대중교통·도로 상황을 다시 확인하세요.",
+        ),
+        (
+            "가족에게 무엇을 먼저 공유해야 하나요?",
+            "현재 경보 단계, 대피 여부, 만날 장소, 비상 연락처, 차량·지하공간 이용 금지 여부를 "
+            "짧게 공유하는 것이 가장 실용적입니다.",
+        ),
+    ],
+    "법률": [
+        (
+            "아직 고소·소송 당사자가 아닌데 준비할 게 있나요?",
+            "비슷한 계약·거래를 앞두고 있다면 약관, 고지 의무, 철회·해지 조건을 미리 확인하는 "
+            "것만으로도 위험을 줄일 수 있습니다.",
+        ),
+        (
+            "변호사 상담 전에 무엇을 챙기면 좋나요?",
+            "시계열로 정리한 사실관계, 계약서, 송금·대화 기록, 공식 문서 사본을 준비하면 "
+            "상담 시간과 비용을 아낄 수 있습니다.",
+        ),
+    ],
+    "스포츠": [
+        (
+            "하이라이트만 보면 충분할까요?",
+            "장면 이해에는 도움이 되지만, 최종 스코어·교체·심판 판정·다음 일정은 "
+            "공식 기록과 구단 발표로 다시 확인하는 편이 정확합니다.",
+        ),
+        (
+            "직관 전에 무엇을 먼저 보나요?",
+            "경기 시작 시간, 중계·입장 안내, 우천·연기 여부, 선발 라인업을 순서대로 "
+            "확인하면 일정 낭비를 줄일 수 있습니다.",
+        ),
+    ],
+}
+
+
+def _clean_headline(title: str) -> str:
+    title = title.strip()
+    return title[:120]
+
+
+def _extract_angle(keyword: str, news: list[NewsRef]) -> str:
+    """Pull a short concrete fact (a number/%/amount/date) from the real
+    headlines so the title reflects this specific topic's content instead
+    of a bare category label. Returns "" when nothing usable is found, or
+    when the match is already part of the keyword itself.
+
+    A fragment must appear in at least two recent headlines so a one-off
+    amount like "110만원" from a single deposit-rate story cannot warp the
+    title of an unrelated/generic keyword.
+    """
+    candidates: list[str] = []
+    for item in news[:8]:
+        match = _ANGLE_RE.search(item.title)
+        if not match:
+            continue
+        frag = re.sub(r"\s+", "", match.group(0))
+        if frag and frag not in keyword and len(frag) <= 10:
+            candidates.append(frag)
+    if not candidates:
+        return ""
+    # Prefer the most repeated concrete fragment across headlines.
+    counts: dict[str, int] = {}
+    for frag in candidates:
+        counts[frag] = counts.get(frag, 0) + 1
+    best, best_n = max(counts.items(), key=lambda kv: (kv[1], len(kv[0])))
+    if best_n < 2:
+        return ""
+    return best
+
+
+def build_title(keyword: str, category: str, news: list[NewsRef] | None = None) -> str:
+    news = news or []
+    if is_earnings_topic(keyword, news):
+        templates = _EARNINGS_TITLE_TEMPLATES
+    else:
+        templates = CATEGORY_TITLE_TEMPLATES.get(category, _DEFAULT_TITLE_TEMPLATES)
+    variant = int(hashlib.md5(keyword.encode("utf-8")).hexdigest(), 16) % len(templates)
+    template = templates[variant]
+
+    angle = _extract_angle(keyword, news)
+    angle_fragment = f"({angle})" if angle else ""
+    return template.format(keyword=keyword, angle=angle_fragment)
+
+
+def _extract_schedule_hints(news: list[NewsRef]) -> list[str]:
+    hints: list[str] = []
+    seen: set[str] = set()
+    for item in news[:10]:
+        for match in _SCHEDULE_RE.finditer(item.title):
+            frag = re.sub(r"\s+", "", match.group(0))
+            if frag and frag not in seen:
+                seen.add(frag)
+                hints.append(frag)
+    return hints[:5]
+
+
+def _extract_focus_points(news: list[NewsRef]) -> list[str]:
+    counts: dict[str, int] = {}
+    for item in news[:12]:
+        title = item.title
+        for term in _FOCUS_TERMS:
+            if term.lower() in title.lower():
+                counts[term] = counts.get(term, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], -len(kv[0])))
+    return [term for term, n in ranked if n >= 1][:6]
+
+
+def build_earnings_issue_section(keyword: str, news: list[NewsRef]) -> str:
+    parts = [_h3("1. 이슈가 무엇인가")]
+    headlines = _unique_headlines(news, 6)
+    schedules = _extract_schedule_hints(news)
+    focuses = _extract_focus_points(news)
+
+    parts.append(
+        _p(
+            f"'{keyword}' 검색이 늘 때는 보통 ‘언제 나오는지’와 ‘숫자·가이던스가 어떻게 나왔는지’를 "
+            f"확인하려는 수요가 겹칩니다. 아래는 현재 보도를 기준으로 일정·관전 포인트만 먼저 정리한 내용입니다."
+        )
+    )
+    if schedules:
+        parts.append(_p("보도에서 반복되는 일정·시점 힌트입니다. 공식 IR 캘린더와 교차 확인하세요."))
+        parts.append(_ul([f"일정 힌트: {s}" for s in schedules]))
+    if focuses:
+        parts.append(
+            _p(
+                "시장이 이번 발표에서 특히 보는 키워드는 다음과 같습니다. "
+                "실제 숫자는 회사 IR/SEC 공시 원문을 기준으로 보세요."
+            )
+        )
+        parts.append(_ul([f"관전 포인트: {f}" for f in focuses]))
+    if headlines:
+        parts.append(_p("주요 보도에서 확인되는 골격입니다."))
+        parts.append(
+            _ul([f"{_clean_headline(item.title)}" + (f" ({item.source})" if item.source else "") for item in headlines])
+        )
+    parts.append(
+        _p(
+            "프리뷰 기사와 실제 발표는 다를 수 있습니다. ‘예상치’와 ‘실제 발표치’, "
+            "그리고 다음 분기 가이던스를 구분해 메모해 두면 이후 확인이 빨라집니다."
+        )
+    )
+    return "".join(parts)
+
+
+def build_earnings_impact_section(keyword: str) -> str:
+    return "".join(
+        [
+            _h3("2. 무엇이 영향받는가"),
+            _p(
+                f"'{keyword}'는 해당 기업 주가뿐 아니라 관련 테마(반도체·클라우드·광고·AI 인프라)와 "
+                f"국내외 연계 종목·ETF 변동성에도 영향을 줄 수 있습니다."
+            ),
+            _p("특히 아래 유형이라면 발표 전후 구간을 더 자세히 보는 편이 좋습니다."),
+            _ul(
+                [
+                    "해당 기업·모회사 주식이나 ADR을 보유/관심 중인 투자자",
+                    "관련 반도체·클라우드·광고 테마 종목·ETF를 담은 사람",
+                    "실적 시즌 변동성에 노출된 단기·스윙 트레이더",
+                    "연금·ISA 등으로 동일 테마에 간접 노출된 투자자",
+                ]
+            ),
+            _p("영향 경로를 구체적으로 보면 다음과 같습니다."),
+            _ul(
+                [
+                    "매출·영업이익·EPS가 컨센서스를 상회/하회하면 시간외·정규장 변동폭이 커질 수 있습니다.",
+                    "AI 투자·캡엑스·클라우드 성장률 같은 질적 지표가 가이던스와 어긋나면 테마주까지 동반 움직일 수 있습니다.",
+                    "미국 빅테크 실적은 국내 반도체·장비주 심리에도 전이되는 경우가 많습니다.",
+                ]
+            ),
+        ]
+    )
+
+
+def build_earnings_check_section(keyword: str) -> str:
+    return "".join(
+        [
+            _h3("3. 관련해서 확인할 방법"),
+            _p(
+                f"'{keyword}'는 검색 요약보다 ‘공식 일정 → 실제 숫자 → 내 보유 종목’ 순서로 확인하는 것이 안전합니다."
+            ),
+            _ul(
+                [
+                    "회사 Investor Relations / SEC EDGAR(또는 거래소 공시)에서 발표 일정과 실적 자료를 확인합니다.",
+                    "매출, 영업이익, EPS, 클라우드/광고 등 핵심 부문 성장률을 컨센서스와 비교합니다.",
+                    "다음 분기·연간 가이던스와 캡엑스(설비투자) 코멘트를 별도로 적어 둡니다.",
+                    "증권사 프리뷰와 실제 발표 후 리액션 기사에서 ‘예상 대비 어디가 달랐는지’를 확인합니다.",
+                    "본인 계좌의 해당 종목·관련 ETF 비중, 예약주문, 환율 노출을 앱에서 재확인합니다.",
+                ]
+            ),
+            _p(
+                "일정과 수치는 매체마다 시차가 있습니다. 가능하면 회사 원문 자료의 타임스탬프를 기준으로 정리하세요."
+            ),
+        ]
+    )
+
+
+def build_earnings_response_section(keyword: str) -> str:
+    return "".join(
+        [
+            _h3("4. 해결·대응 방법"),
+            _p(
+                f"'{keyword}' 대응의 핵심은 ‘속보 제목으로 바로 매매’보다 "
+                f"숫자 확인 → 보유 비중 점검 → 후속 가이던스 추적 순서입니다."
+            ),
+            _ul(
+                [
+                    "발표 전: 본인 비중과 손실 허용 범위를 먼저 정해 두고, 추측성 선매매를 줄입니다.",
+                    "발표 직후: 매출·이익·가이던스 3가지만 먼저 표로 정리한 뒤 매매 여부를 판단합니다.",
+                    "관련 테마주까지 흔들리면 동일 리스크가 중복인지(반도체·클라우드 등) 비중을 재계산합니다.",
+                    "추가 매수/매도 전이라면 분할 집행이나 관망으로 속도를 낮춥니다.",
+                    "발표 다음 1~2거래일 리액션과 애널리스트 목표주가 변경을 후속으로 확인합니다.",
+                ]
+            ),
+            _p("피해야 할 실수도 분명합니다."),
+            _ul(
+                [
+                    "프리뷰 기사만 보고 실제 숫자 확인 전에 전량 매수·매도하는 것",
+                    "‘어닝스 비트’ 헤드라인만 보고 가이던스 하향을 놓치는 것",
+                    "레버리지·미수 상태에서 변동성 구간을 버티려다 강제청산 위험을 키우는 것",
+                ]
+            ),
+        ]
+    )
+
+
+def build_earnings_faq_section() -> str:
+    faqs = [
+        (
+            "실적발표에서 뭐부터 보면 되나요?",
+            "일정(언제) → 매출·영업이익·EPS(얼마) → 가이던스/캡엑스(앞으로) 순서가 가장 실용적입니다.",
+        ),
+        (
+            "컨센서스를 넘기면 무조건 호재인가요?",
+            "아닙니다. 이번 분기 숫자는 좋아도 다음 분기 가이던스가 낮으면 주가가 반대로 움직일 수 있습니다.",
+        ),
+    ]
+    parts = [
+        _h3("자주 묻는 포인트"),
+        _p("실적발표를 검색하는 사람들이 실제로 자주 묻는 지점만 짧게 정리했습니다."),
+    ]
+    for q, a in faqs:
+        parts.append(_p(f"Q. {q}"))
+        parts.append(_p(f"A. {a}"))
+    return "".join(parts)
+
+
+def build_earnings_summary_section(keyword: str) -> str:
+    return "".join(
+        [
+            _h3("한눈에 정리"),
+            _p(
+                f"1) '{keyword}'는 일정과 실적 숫자를 확인하려는 검색 수요가 큰 투자 이슈입니다. "
+                f"2) 영향은 해당 종목뿐 아니라 관련 테마·국내 연계주로 번질 수 있습니다. "
+                f"3) 공식 IR/공시로 일정·숫자를 확인하고, 4) 비중·가이던스 기준으로 대응한 뒤 "
+                f"5) 후속 보도로 업데이트하면 됩니다."
+            ),
+        ]
+    )
+
+
+def _p(text: str) -> str:
+    return f"<p>{escape(text)}</p>"
+
+
+def _h3(text: str) -> str:
+    return f"<h3>{escape(text)}</h3>"
+
+
+def _ul(items: list[str]) -> str:
+    lis = "".join(f"<li>{escape(i)}</li>" for i in items)
+    return f"<ul>{lis}</ul>"
+
+
+def _unique_headlines(news: list[NewsRef], limit: int) -> list[NewsRef]:
+    seen: set[str] = set()
+    out: list[NewsRef] = []
+    for item in news:
+        title = _clean_headline(item.title)
+        key = title.replace(" ", "")
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def build_issue_section(keyword: str, category: str, news: list[NewsRef]) -> str:
+    parts = [_h3("1. 이슈가 무엇인가")]
+    headlines = _unique_headlines(news, 6)
+    parts.append(
+        _p(
+            f"최근 '{keyword}' 관련 검색과 보도가 함께 늘어나며 정보성 이슈로 부각되고 있습니다. "
+            f"아래는 현재 확인되는 언론 보도를 기준으로 사건의 골격만 먼저 정리한 내용입니다."
+        )
+    )
+    parts.append(_p(CATEGORY_ISSUE_CONTEXT.get(category, "")))
+
+    if headlines:
+        parts.append(_p("주요 보도에서 반복적으로 확인되는 포인트는 다음과 같습니다."))
+        bullet_points = []
+        for item in headlines:
+            source = f" ({item.source})" if item.source else ""
+            bullet_points.append(f"{_clean_headline(item.title)}{source}")
+        parts.append(_ul(bullet_points))
+        parts.append(
+            _p(
+                f"한 줄로 보면, '{keyword}'는 단순 호기심성 검색어라기보다 "
+                f"사람들이 실제 대응 방법을 찾아보는 과정에서 검색량이 커진 주제에 가깝습니다. "
+                f"따라서 제목만 훑기보다 적용 대상·일정·위험 구간을 함께 보는 것이 좋습니다."
+            )
+        )
+        if len(headlines) >= 3:
+            parts.append(
+                _p(
+                    "보도마다 표현은 달라도 핵심 사실관계는 대체로 같은 방향을 가리키는지 먼저 보고, "
+                    "수치·날짜·지역·기관명이 다른 부분만 따로 메모해 두면 이후 확인이 빨라집니다."
+                )
+            )
+    else:
+        parts.append(_p(f"현재 '{keyword}'에 대한 공개 보도가 제한적이므로, 공식 기관 발표가 나오는 대로 내용을 보완하는 것이 좋습니다."))
+    return "".join(parts)
+
+
+def build_impact_section(keyword: str, category: str) -> str:
+    intro = CATEGORY_IMPACT_INTRO.get(category, f"'{keyword}'는 실생활에 영향을 줄 수 있는 사안으로 분류됩니다.")
+    who = CATEGORY_WHO_AFFECTED.get(category, [])
+    details = CATEGORY_IMPACT_DETAIL.get(category, [])
+    parts = [
+        _h3("2. 무엇이 영향받는가"),
+        _p(intro),
+        _p(
+            f"'{keyword}'의 영향은 모든 사람에게 동일한 강도로 오지 않습니다. "
+            f"거주 지역, 보유 자산, 계약 상태, 건강 상태, 가족 구성에 따라 체감 시점이 달라질 수 있습니다."
+        ),
+    ]
+    if who:
+        parts.append(_p("특히 아래 유형에 해당한다면 우선적으로 확인해 보세요."))
+        parts.append(_ul(who))
+    if details:
+        parts.append(_p("구체적으로는 다음과 같은 경로로 일상에 영향을 줄 수 있습니다."))
+        parts.append(_ul(details))
+    parts.append(
+        _p(
+            "반대로, 직접 해당하지 않더라도 가족·동료·거래 상대방이 영향을 받을 수 있으니 "
+            "필요한 정보는 짧게라도 공유해 두는 편이 안전합니다."
+        )
+    )
+    return "".join(parts)
+
+
+def build_check_section(keyword: str, category: str) -> str:
+    checks = CATEGORY_CHECK.get(category, ["관련 기관 공식 발표 및 언론 보도로 사실관계 재확인"])
+    parts = [
+        _h3("3. 관련해서 확인할 방법"),
+        _p(
+            f"'{keyword}'를 검색만 하고 끝내기보다, 아래 순서로 확인하면 "
+            f"잘못된 정보나 오래된 기사에 흔들릴 가능성을 줄일 수 있습니다."
+        ),
+        _p("확인은 ‘공식 발표 → 내 계정/계약/지역 정보 → 후속 보도’ 순서가 안정적입니다."),
+        _ul(checks),
+        _p(
+            "확인할 때는 날짜와 적용 대상을 반드시 메모하세요. "
+            "같은 키워드라도 어제 보도와 오늘 보도의 권고 사항이 달라질 수 있습니다."
+        ),
+    ]
+    return "".join(parts)
+
+
+def build_response_section(keyword: str, category: str) -> str:
+    actions = CATEGORY_RESPONSE.get(category, ["추가 공식 발표를 확인하며 상황에 맞게 대응하기"])
+    mistakes = CATEGORY_MISTAKES.get(category, [])
+    parts = [
+        _h3("4. 해결·대응 방법"),
+        _p(
+            f"'{keyword}'에 대한 대응은 ‘많이 하는 것’보다 ‘순서대로 하는 것’이 중요합니다. "
+            f"아래 체크리스트를 위에서부터 적용해 보세요."
+        ),
+        _ul(actions),
+    ]
+    if mistakes:
+        parts.append(_p("반대로 피해야 할 대응도 분명합니다."))
+        parts.append(_ul(mistakes))
+    parts.append(
+        _p(
+            "상황이 빠르게 변하면 대응안도 업데이트되어야 합니다. "
+            "오늘 확인한 내용과 내일 공식 발표가 다르면, 오래된 계획을 고집하기보다 "
+            "바뀐 조건을 기준으로 다시 정리하는 것이 맞습니다."
+        )
+    )
+    return "".join(parts)
+
+
+def build_faq_section(category: str) -> str:
+    faqs = CATEGORY_FAQ.get(category) or []
+    if not faqs:
+        return ""
+    parts = [
+        _h3("자주 묻는 포인트"),
+        _p("같은 이슈를 검색하는 사람들이 실제로 자주 헷갈려 하는 지점만 짧게 정리했습니다."),
+    ]
+    for question, answer in faqs:
+        parts.append(_p(f"Q. {question}"))
+        parts.append(_p(f"A. {answer}"))
+    return "".join(parts)
+
+
+def build_related_news_section(news: list[NewsRef]) -> str:
+    items = _unique_headlines(news, 8)
+    if not items:
+        return ""
+    parts = [
+        _h3("5. 관련 소식"),
+        _p("추가 사실관계와 후속 발표를 확인할 때 참고할 수 있는 최근 보도입니다. 링크별 날짜와 소스를 함께 보세요."),
+    ]
+    lis = []
+    for n in items:
+        title = escape(_clean_headline(n.title))
+        source = escape(n.source) if n.source else ""
+        if n.url:
+            link = f'<a href="{escape(n.url)}" rel="nofollow noopener" target="_blank">{title}</a>'
+        else:
+            link = title
+        suffix = f" - {source}" if source else ""
+        lis.append(f"<li>{link}{suffix}</li>")
+    parts.append(f"<ul>{''.join(lis)}</ul>")
+    parts.append(
+        _p(
+            "같은 제목이 반복되면 이슈가 아직 진행 중일 가능성이 큽니다. "
+            "서로 다른 매체가 같은 수치·날짜를 쓰는지 비교해 보면 신뢰도를 판단하기 쉽습니다."
+        )
+    )
+    return "".join(parts)
+
+
+def build_summary_section(keyword: str, category: str) -> str:
+    return "".join(
+        [
+            _h3("한눈에 정리"),
+            _p(
+                f"1) '{keyword}' 검색·보도가 함께 늘어난 {category} 관련 이슈입니다. "
+                f"2) 영향은 모든 사람에게 같지 않으니 본인 계약·지역·건강·자산 상태를 기준으로 봅니다. "
+                f"3) 공식 발표와 내 계정/지역 정보를 먼저 확인하고, 4) 체크리스트 순서대로 대응한 뒤 "
+                f"5) 후속 보도로 내용을 업데이트하면 됩니다."
+            ),
+        ]
+    )
+
+
+def build_body_html(keyword: str, category: str, news: list[NewsRef]) -> str:
+    if is_earnings_topic(keyword, news):
+        sections = [
+            build_earnings_issue_section(keyword, news),
+            build_earnings_impact_section(keyword),
+            build_earnings_check_section(keyword),
+            build_earnings_response_section(keyword),
+            build_earnings_faq_section(),
+            build_related_news_section(news),
+            build_earnings_summary_section(keyword),
+            _p(
+                "본 글은 공개된 트렌드 지표와 언론 보도를 바탕으로 정리한 정보성 콘텐츠입니다. "
+                "실적 수치·발표 일정은 회사 공식 IR/공시 원문을 최종 기준으로 확인하시기 바랍니다."
+            ),
+        ]
+    else:
+        sections = [
+            build_issue_section(keyword, category, news),
+            build_impact_section(keyword, category),
+            build_check_section(keyword, category),
+            build_response_section(keyword, category),
+            build_faq_section(category),
+            build_related_news_section(news),
+            build_summary_section(keyword, category),
+            _p(
+                "본 글은 공개된 트렌드 지표와 언론 보도를 바탕으로 정리한 정보성 콘텐츠입니다. "
+                "수치, 일정, 적용 대상은 이후 공식 발표에 따라 달라질 수 있으니 최신 공지를 함께 확인하시기 바랍니다."
+            ),
+        ]
+    return "\n".join(s for s in sections if s)
