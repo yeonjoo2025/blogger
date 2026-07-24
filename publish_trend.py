@@ -86,6 +86,12 @@ QUOTA_STATE_PATH = Path(".blogger_quota_state.json")
 PENDING_DIR = Path("pending_posts")
 MIN_USEFULNESS_SCORE = 7
 
+# Blackkiwi "새롭게 등장한 키워드" (source=blackkiwi_new) novelty boost.
+# Kept large so fresh keywords outrank stale risers inside the same tier
+# after usefulness passes; does not bypass usefulness / dedupe gates.
+NOVELTY_BASE_BONUS = 35.0
+NOVELTY_RANK_BONUS_MAX = 12.0  # rank 1 → +12, tapering toward lower ranks
+
 # Editorial cap: how many topics we're willing to write about per run. This
 # is a *content quality* decision ("가장 이슈가 되는 것만 작성, 애매하면
 # 줄인다"), deliberately independent of the API quota constant below. This
@@ -266,11 +272,32 @@ def score_usefulness(
     return score, intent, ",".join(reasons)
 
 
+def is_blackkiwi_new(sources: set[str]) -> bool:
+    """True when the group includes Blackkiwi's newly-appeared keyword panel."""
+    return any((s or "").lower() == "blackkiwi_new" for s in sources)
+
+
+def novelty_bonus(items: list[TrendItem]) -> float:
+    """Extra ranking points for Blackkiwi newly-appeared keywords.
+
+    Base bonus is intentionally high (~one multi-source confirmation) so
+    fresh topics surface first; top ranks in the new panel get a bit more.
+    """
+    new_items = [i for i in items if (i.source or "").lower() == "blackkiwi_new"]
+    if not new_items:
+        return 0.0
+    best_new_rank = min((i.rank for i in new_items if i.rank), default=10)
+    # rank 1 → full NOVELTY_RANK_BONUS_MAX, rank 10+ → ~0
+    rank_bonus = max(0.0, NOVELTY_RANK_BONUS_MAX - (best_new_rank - 1) * 1.2)
+    return NOVELTY_BASE_BONUS + rank_bonus
+
+
 def score_group(items: list[TrendItem], news_count: int, coherence: float) -> float:
     """Rank candidates mainly by how well *substantiated and focused* the
     issue is: real news volume, single-event headline coherence, and
-    confirmation from more than one collection source. Trend rank/traffic/
-    window breadth are only secondary tie-breakers.
+    confirmation from more than one collection source. Blackkiwi newly-
+    appeared keywords get a strong novelty boost; trend rank/traffic/
+    window breadth remain secondary tie-breakers.
     """
     sources = {i.source for i in items}
     windows = set()
@@ -289,6 +316,8 @@ def score_group(items: list[TrendItem], news_count: int, coherence: float) -> fl
     score += len(windows) * 4
     score += max(0, 15 - best_rank) * 0.5
     score += min(traffic, 20000) / 1000
+    # Fresh Blackkiwi keywords outrank stale risers inside the same tier.
+    score += novelty_bonus(items)
     return score
 
 
@@ -329,10 +358,12 @@ def build_candidates(now: datetime) -> list[TopicCandidate]:
         traffic = max((i.traffic for i in items if i.traffic), default=0)
         coherence = headline_coherence(search_kw, news)
         score = score_group(items, len(news), coherence)
+        novelty = novelty_bonus(items)
 
         log(
             f"  candidate '{display_kw}' [{category}] score={score:.1f} coherence={coherence:.2f} "
             f"sources={sources} windows={windows}"
+            + (f" NOVELTY_BONUS={novelty:.1f}" if novelty else "")
         )
         candidates.append(
             TopicCandidate(
@@ -450,8 +481,14 @@ def select_final_topics(
 
     best_tier = min(t for t, *_ in tiered)
     pool = [row for row in tiered if row[0] == best_tier]
-    # Within the same tier: usefulness, then trend score.
-    pool.sort(key=lambda row: (-row[2], -row[1].score))
+    # Within the same tier: usefulness, then novelty, then trend score.
+    pool.sort(
+        key=lambda row: (
+            -row[2],
+            -int(is_blackkiwi_new(row[1].sources)),
+            -row[1].score,
+        )
+    )
 
     final: list[TopicCandidate] = []
     used_categories: set[str] = set()
@@ -460,9 +497,10 @@ def select_final_topics(
             continue
         if any(is_near_duplicate(cand.keyword, f.keyword) for f in final):
             continue
+        novelty_tag = " NOVELTY=1" if is_blackkiwi_new(cand.sources) else ""
         log(
             f"PICK_KEYWORD={cand.keyword} PICK_TIER={tier} SOURCE_HIT={source_hit} "
-            f"INTENT={intent} USEFULNESS_SCORE={useful}"
+            f"INTENT={intent} USEFULNESS_SCORE={useful}{novelty_tag}"
         )
         final.append(cand)
         used_categories.add(cand.category)
