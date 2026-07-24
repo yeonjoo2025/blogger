@@ -6,7 +6,7 @@ source: https://news.samsung.com/kr/galaxy-unpacked-2026
 
 삼성전자가 런던 ‘갤럭시 언팩 2026’에서 **갤럭시 Z 폴드8·폴드8 울트라·플립8** 폴더블 3종을 공개했습니다. 이번 글은 뉴스 요약이 아니라, **내가 어떤 모델을 고르고 언제·어디서 사전판매를 잡아야 하는지**를 바로 판단할 수 있게 정리한 구매 체크리스트입니다.
 
-![갤럭시 폴더블 3종 구매 가이드 썸네일](images/thumb-galaxy-foldable.jpg)
+![갤럭시 폴더블 3종 구매 가이드 썸네일](https://cdn.jsdelivr.net/gh/yeonjoo2025/blogger@4010f5f/posts/images/thumb-galaxy-foldable.jpg)
 
 ### 한 줄 요약
 이 글을 읽으면 **폴드8 / 폴드8 울트라 / 플립8 중 나에게 맞는 모델**을 고르고, **7월 28일~8월 3일 사전판매**에 맞춰 용량·혜택까지 확인할 수 있습니다.
