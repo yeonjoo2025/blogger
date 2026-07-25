@@ -9,7 +9,9 @@ from typing import Iterable
 MIN_BODY_CHARS = 2500
 MIN_LABELS = 15
 TARGET_LABELS = 20
+# Blogger rejects oversized label payloads; count UTF-8 bytes (Korean ≈ 3 bytes/char).
 MAX_LABEL_CHARS_TOTAL = 180
+MAX_LABEL_BYTES_TOTAL = 180
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2
 
@@ -166,31 +168,46 @@ def sanitize_labels(
             seen.add(key)
             cleaned.insert(0, lab)
 
-    # Fit Blogger practical limits: count + total chars.
+    # Prefer shorter tokens first so we can pack 15~20 labels under byte budget.
+    cleaned.sort(key=lambda x: (len(x.encode("utf-8")), len(x)))
+
+    # Fit Blogger practical limits: count + UTF-8 bytes (+ commas).
     out: list[str] = []
-    total = 0
+    total_chars = 0
+    total_bytes = 0
     for lab in cleaned:
-        add = len(lab) + (1 if out else 0)
+        sep = 1 if out else 0
+        add_chars = len(lab) + sep
+        add_bytes = len(lab.encode("utf-8")) + sep
         if len(out) >= target:
             break
-        if total + add > MAX_LABEL_CHARS_TOTAL:
+        if total_chars + add_chars > MAX_LABEL_CHARS_TOTAL:
+            continue
+        if total_bytes + add_bytes > MAX_LABEL_BYTES_TOTAL:
             continue
         out.append(lab)
-        total += add
+        total_chars += add_chars
+        total_bytes += add_bytes
 
     # Pad with short topical tokens if under minimum.
-    pads = ["일정", "확인", "방법", "체크리스트", "공식", "신청", "비교", "가이드", "주의", "FAQ"]
+    pads = ["일정", "확인", "방법", "체크", "공식", "신청", "비교", "가이드", "주의", "FAQ", "방문", "당일"]
     for lab in pads:
         if len(out) >= target:
             break
         key = normalize_text(lab)
         if key in seen:
             continue
-        if total + len(lab) + 1 > MAX_LABEL_CHARS_TOTAL:
+        sep = 1 if out else 0
+        add_chars = len(lab) + sep
+        add_bytes = len(lab.encode("utf-8")) + sep
+        if total_chars + add_chars > MAX_LABEL_CHARS_TOTAL:
+            continue
+        if total_bytes + add_bytes > MAX_LABEL_BYTES_TOTAL:
             continue
         seen.add(key)
         out.append(lab)
-        total += len(lab) + 1
+        total_chars += add_chars
+        total_bytes += add_bytes
     return out
 
 
