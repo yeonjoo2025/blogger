@@ -168,47 +168,59 @@ def sanitize_labels(
             seen.add(key)
             cleaned.insert(0, lab)
 
-    # Prefer shorter tokens first so we can pack 15~20 labels under byte budget.
-    cleaned.sort(key=lambda x: (len(x.encode("utf-8")), len(x)))
+    def _fits(current: list[str], lab: str) -> bool:
+        raw = ",".join(current + [lab]) if current else lab
+        return len(raw) <= MAX_LABEL_CHARS_TOTAL and len(raw.encode("utf-8")) <= MAX_LABEL_BYTES_TOTAL
 
-    # Fit Blogger practical limits: count + UTF-8 bytes (+ commas).
+    # Keep short keyword/category seeds, then shortest remaining tokens.
+    seeds = [lab for lab in cleaned if lab in extras][:3]
+    rest = [lab for lab in cleaned if lab not in seeds]
+    rest.sort(key=lambda x: (len(x.encode("utf-8")), len(x)))
+    ordered = seeds + rest
+
     out: list[str] = []
-    total_chars = 0
-    total_bytes = 0
-    for lab in cleaned:
-        sep = 1 if out else 0
-        add_chars = len(lab) + sep
-        add_bytes = len(lab.encode("utf-8")) + sep
+    for lab in ordered:
         if len(out) >= target:
             break
-        if total_chars + add_chars > MAX_LABEL_CHARS_TOTAL:
-            continue
-        if total_bytes + add_bytes > MAX_LABEL_BYTES_TOTAL:
-            continue
-        out.append(lab)
-        total_chars += add_chars
-        total_bytes += add_bytes
+        if _fits(out, lab):
+            out.append(lab)
 
-    # Pad with short topical tokens if under minimum.
-    pads = ["일정", "확인", "방법", "체크", "공식", "신청", "비교", "가이드", "주의", "FAQ", "방문", "당일"]
-    for lab in pads:
-        if len(out) >= target:
+    # If over-byte risk blocked MIN_LABELS, drop longest and refill with short pads.
+    pads = [
+        "일정", "확인", "방법", "체크", "공식", "신청", "비교", "가이드", "주의",
+        "FAQ", "방문", "당일", "주차", "예약", "대상", "정리", "팁", "후기",
+    ]
+    guard = 0
+    while len(out) < MIN_LABELS and guard < 12:
+        guard += 1
+        progressed = False
+        for lab in pads:
+            if len(out) >= target:
+                break
+            key = normalize_text(lab)
+            if key in {normalize_text(x) for x in out}:
+                continue
+            if _fits(out, lab):
+                out.append(lab)
+                progressed = True
+        if len(out) >= MIN_LABELS:
             break
-        key = normalize_text(lab)
-        if key in seen:
+        # Drop the longest non-seed label to free UTF-8 budget.
+        drop_idx = None
+        drop_len = -1
+        for i, lab in enumerate(out):
+            if lab in seeds:
+                continue
+            nbytes = len(lab.encode("utf-8"))
+            if nbytes > drop_len:
+                drop_len = nbytes
+                drop_idx = i
+        if drop_idx is None:
+            break
+        out.pop(drop_idx)
+        if not progressed and drop_idx is not None:
             continue
-        sep = 1 if out else 0
-        add_chars = len(lab) + sep
-        add_bytes = len(lab.encode("utf-8")) + sep
-        if total_chars + add_chars > MAX_LABEL_CHARS_TOTAL:
-            continue
-        if total_bytes + add_bytes > MAX_LABEL_BYTES_TOTAL:
-            continue
-        seen.add(key)
-        out.append(lab)
-        total_chars += add_chars
-        total_bytes += add_bytes
-    return out
+    return out[:target]
 
 
 def title_ok(title: str, recent_titles: list[str] | None = None) -> tuple[bool, str]:
