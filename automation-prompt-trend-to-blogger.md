@@ -27,7 +27,7 @@ Cursor Automations Instructions에 **아래 “시작 시 반드시”부터 끝
 검색량만 높은 스포츠/연예 요약보다 **가이드·IT·제도 해설**을 우선한다.
 
 이번 자동화에서 자주 빠지는 아래 두 가지를 절대 생략하지 말 것:
-A) Blogger labels(태그) 15~20개 (`sanitize_labels` 통과본)
+A) Blogger labels(태그) 15~19개 (`sanitize_labels` 통과본, Blogger가 20개 patch를 거절하는 경우 있음)
 B) 다른 포스트와 같은 품질의 AI 시네마틱 썸네일 + **jsDelivr CDN URL**
    (Pillow 막대그래프/도형 폴백 금지, data URI 썸네일 금지)
 
@@ -39,7 +39,7 @@ B) 다른 포스트와 같은 품질의 AI 시네마틱 썸네일 + **jsDelivr C
 [STEP 2] 통계 갱신 (조회수 피드백)
   python3 fetch_stats.py
   - `.blogger_stats.json` 생성/갱신
-  - 로그의 PAGEVIEWS_ALL / CATEGORY_COUNTS 확인
+  - 로그에서 PAGEVIEWS_ALL / CATEGORY_COUNTS 확인
   - 이후 키워드 선정·카테고리 선택에 반영
 
 [STEP 3] 키워드 수집·후보 선정 (아래 소스/티어/필터 규칙)
@@ -59,18 +59,36 @@ B) 다른 포스트와 같은 품질의 AI 시네마틱 썸네일 + **jsDelivr C
   - 저장 후 반드시 다시 실행:
     python3 publish_trend.py --slug {slug} --keyword "{키워드}"
 
-[STEP 6] 발행 성공 검증 (하나라도 실패면 미완료)
+[STEP 6] insert 403/429 또는 빈 셸 없음 → **임시보관(DRAFT) 재사용 발행** (필수)
+  - `publish_trend.py` 가 `INSERT_FAIL` / `FALLBACK_REUSE_DRAFT` 를 처리한다.
+  - 코드 우선순위 (`publish_or_patch` / `find_reusable_draft`):
+    1) 빈 LIVE/DRAFT 셸 patch/update 후 publish
+    2) 셸이 없을 때만 `posts.insert`
+    3) insert 403/429 이면 **임시보관 DRAFT를 재사용**해 본문·라벨·썸네일을 덮어쓰고
+       `published` 를 **현재 시각(KST, RFC3339)** 으로 넣은 뒤 `posts.publish`
+       - DRAFT 선택 우선순위:
+         a) 이미 LIVE에 같은 제목이 있는 중복 임시보관
+         b) hard-skip(연예/스포츠) 주제의 임시보관
+         c) 가장 오래된 임시보관
+  - 에이전트가 위 경로를 우회해 “생성/업데이트 없이 종료”로 끝내지 말 것.
+    재사용 가능한 DRAFT가 있는데도 미발행이면 **미완료**.
+  - 수동 복구가 필요할 때도 동일: DRAFT update + `published=now(KST)` + publish.
+  - 로그 확인: `FALLBACK_REUSE_DRAFT=...` / `PUBLISH_AT=...` / `PUBLISHED_URL=...`
+
+[STEP 7] 발행 성공 검증 (하나라도 실패면 미완료)
   - PUBLISHED_URL=... 로그
-  - labels_count 15개 이상(목표 20)
+  - labels_count 15개 이상(목표 19, 최대 시도 19 — 20개 거절 시 19→15로 축소)
   - 본문에 class="post-thumb" + jsdelivr.net CDN URL
   - `quality ok` 로그
   - USEFULNESS_SCORE>=7
   - data:image 가 본문에 없을 것
+  - `published` 시각이 이번 실행 기준으로 잡혀 있을 것
 
 중요:
 - AI 썸네일 없이 글을 올리면 실패다. Pillow 폴백·data URI 발행 금지.
 - 태그 문장형/잡음 태그는 코드가 제거한다. 통과 후 15개 미만이면 발행 중단.
-- “나중에” 하지 말고, 같은 실행 안에서 STEP 2→6을 끝낸다.
+- “나중에” 하지 말고, 같은 실행 안에서 STEP 2→7을 끝낸다.
+- insert 한도(403)는 실패가 아니라 **DRAFT 재사용 트리거**다.
 
 ════════════════════════════════════════
 키워드 수집 소스 (우선순위 중요)
@@ -80,12 +98,18 @@ B) 다른 포스트와 같은 품질의 AI 시네마틱 썸네일 + **jsDelivr C
    (프론트와 동일한 JSON API 우선:
     /api/service/keyword/issue-keywords,
     /api/service/keyword/new-keywords)
+   ※ 브라우저형 헤더 필수 예:
+     User-Agent=Chrome, Referer/Origin=https://blackkiwi.net
+     (헤더 없으면 403)
 2) https://loword.co.kr/keywordTrend
-   (필요 시 헤드리스 렌더링으로 네이버/구글 실시간 검색어 수집)
+   (JSON: POST https://loword.co.kr/api/v1/keyword/trend/getList
+    body `{"date":"YYYY-MM-DD HH:00"}` — 1h/4h/24h 비교.
+    응답의 naver/google 배열 사용. 필요 시 헤드리스 보조)
 
 보조 소스 (교차검증·중복 확인용):
 3) https://trends.google.co.kr/trending?geo=KR
-   (가능하면 Google Trends KR RSS / 공개 피드 활용)
+   (가능하면 Google Trends KR RSS / 공개 피드 활용
+    예: https://trends.google.co.kr/trending/rss?geo=KR)
    ※ 구글 트렌드에만 있는 키워드는 기본 후보에서 제외하거나 최하 우선
 
 시간 구간:
@@ -112,6 +136,10 @@ B) 다른 포스트와 같은 품질의 AI 시네마틱 썸네일 + **jsDelivr C
 3) 유익도 점수
 4) 최근 7일 미작성 주제
 순으로 1개만 고른다.
+
+※ T1/T2가 연예·드라마·스포츠뿐이면 hard-skip / news-only로 보고
+  하위 티어의 guide/it/society/finance 후보로 내려간다.
+  (상위 티어 “있음” ≠ “발행 가능”)
 
 ════════════════════════════════════════
 선정 규칙 (기본 필터) — 코드 강제
@@ -219,13 +247,15 @@ keyword: {원본 키워드}
 ```
 
 ════════════════════════════════════════
-태그(Blogger labels) — 필수, 15~20개
+태그(Blogger labels) — 필수, 15~19개
 ════════════════════════════════════════
 - 직접 대충 넣지 말고, 발행 시 `sanitize_labels()` 통과본을 사용
 - 금지: 문장형 태그, `움직였습니다` 같은 본문 조각, 연도만, Corp/Inc, `정보성글` 남발
 - 총 글자 수 제한을 넘기면 긴 태그부터 탈락할 수 있음 → 짧고 선명한 토큰 위주
-- 목표 20개, 최소 15개 미만이면 발행 중단
-- insert / 빈 포스트 patch / draft update 모든 경로에 labels 포함
+- 목표 19개(또는 15~19), **20개는 Blogger patch/update에서 400이 날 수 있음**
+  → `fit_labels_for_blogger()` / 19→15 축소 재시도
+- 최소 15개 미만이면 발행 중단
+- insert / 빈 포스트 patch / DRAFT update·publish 모든 경로에 labels 포함
 - 발행 후 labels_count 로그 확인
 
 ════════════════════════════════════════
@@ -269,11 +299,13 @@ GenerateImage 제약:
 - `blogger_quota.py` : 쿨다운·일일/카테고리 쿼터
 - `publish_from_posts.py` : MD→HTML (표/이미지/헤딩/리스트)
 - `publish_trend.py` : 선정 이후 발행 단일 진입점
+  (`find_reusable_draft`, `fit_labels_for_blogger`, `now_published_rfc3339` 포함)
 
 발행 우선순위:
-1) 빈 LIVE/DRAFT 셸이 있으면 patch/update 후 publish
+1) 빈 LIVE/DRAFT 셸이 있으면 patch/update 후 publish (`published=현재 KST`)
 2) 셸이 없을 때만 posts.insert
-3) insert 403/429 이고 셸도 없으면 생성/수정 없이 종료
+3) insert 403/429 이면 임시보관 DRAFT 재사용(update + published=현재 KST + publish)
+4) 재사용 가능한 DRAFT조차 없을 때만 “생성/업데이트 없이 종료”
 
 하루·속도 제한(기본값):
 - 실행당 1개
@@ -301,17 +333,18 @@ GenerateImage 제약:
 완료 기준 (전부 만족해야 완료)
 ════════════════════════════════════════
 - fetch_stats.py 실행됨
-- publish_trend.py 최종 정상 종료 (AI 썸네일 준비 후 재실행 포함)
+- publish_trend.py 최종 정상 종료 (AI 썸네일 준비 후 재실행·DRAFT 재사용 포함)
 - 선정 주제가 있으면:
   1) USEFULNESS_SCORE >= 7
-  2) PUBLISHED_URL 확인
-  3) labels 15~20개
+  2) PUBLISHED_URL 확인 (LIVE)
+  3) labels 15~19개
   4) post-thumb + jsDelivr URL 확인 (data URI 없음)
   5) quality ok
   6) 본문에 즉시행동 + FAQ + 체크리스트 + 공식링크 실재
+  7) 게시 시각이 현재 실행 기준으로 설정됨 (`PUBLISH_AT` / published)
 - 유익도/하드필터/쿼터 미달이면 정상 종료로 간주하고
   `SKIP_LOW_USEFULNESS` / `SKIP_HARD_FILTER` / `SKIP_QUOTA` 로그만 남긴 채 발행하지 않음
-- insert 한도 소진이고 빈 포스트도 없으면
-  “생성/업데이트 없이 종료” 후 종료
+- insert 한도 소진이어도 재사용 DRAFT가 있으면 반드시 발행
+- 재사용 DRAFT도 없을 때만 “생성/업데이트 없이 종료”
 - 애매하면 억지 발행하지 말 것
 - 태그/썸네일 없이 “본문만 올림”으로 끝내지 말 것 (미완료)
