@@ -262,14 +262,25 @@ def build_content(body: str, thumb: str) -> str:
     return thumb_html + html
 
 
-def _patch_with_label_fallback(service, blog_id: str, post_id: str, body: dict) -> dict:
+def _patch_with_label_fallback(
+    service,
+    blog_id: str,
+    post_id: str,
+    *,
+    title: str,
+    content: str,
+    labels: list[str],
+    published: str | None = None,
+) -> dict:
+    """Patch post; retry labels 19→15. Avoid sending kind/blog (can 400)."""
     last_exc: Exception | None = None
-    label_sets = fit_labels_for_blogger(list(body.get("labels") or []))
+    label_sets = fit_labels_for_blogger(labels)
     if not label_sets:
-        label_sets = [list(body.get("labels") or [])[:TARGET_LABELS]]
+        label_sets = [labels[:TARGET_LABELS]]
     for labs in label_sets:
-        attempt = dict(body)
-        attempt["labels"] = labs
+        attempt = {"title": title, "content": content, "labels": labs}
+        if published:
+            attempt["published"] = published
         try:
             print(f"LABELS_TRY={len(labs)}")
             return service.posts().patch(blogId=blog_id, postId=post_id, body=attempt).execute()
@@ -278,6 +289,23 @@ def _patch_with_label_fallback(service, blog_id: str, post_id: str, body: dict) 
             msg = str(exc)
             if "400" in msg or "label" in msg.lower():
                 print(f"LABELS_RETRY_AFTER_FAIL={len(labs)} err={msg[:160]}")
+                # LIVE posts often reject published updates — retry without it.
+                if published and "published" in attempt:
+                    try:
+                        attempt.pop("published", None)
+                        print("RETRY_WITHOUT_PUBLISHED")
+                        return (
+                            service.posts()
+                            .patch(blogId=blog_id, postId=post_id, body=attempt)
+                            .execute()
+                        )
+                    except Exception as exc2:
+                        last_exc = exc2
+                        msg = str(exc2)
+                        if "400" in msg or "label" in msg.lower():
+                            print(f"LABELS_RETRY_AFTER_FAIL={len(labs)} err={msg[:160]}")
+                            continue
+                        raise
                 continue
             raise
     assert last_exc is not None
@@ -287,12 +315,13 @@ def _patch_with_label_fallback(service, blog_id: str, post_id: str, body: dict) 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_empty_shell(service, blog_id)
     publish_at = now_rfc3339_kst()
-    body = {
+    labels = labels[:TARGET_LABELS]
+    insert_body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
         "title": title,
         "content": content,
-        "labels": labels[:TARGET_LABELS],
+        "labels": labels,
         "published": publish_at,
     }
     if shell:
@@ -301,13 +330,29 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         print(f"USING_SHELL={post_id} status={status}")
         print(f"PUBLISH_AT={publish_at}")
         if status == "DRAFT":
-            _patch_with_label_fallback(service, blog_id, post_id, body)
+            _patch_with_label_fallback(
+                service,
+                blog_id,
+                post_id,
+                title=title,
+                content=content,
+                labels=labels,
+                published=publish_at,
+            )
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return _patch_with_label_fallback(service, blog_id, post_id, body)
+        return _patch_with_label_fallback(
+            service,
+            blog_id,
+            post_id,
+            title=title,
+            content=content,
+            labels=labels,
+            published=None,  # LIVE patch rejects published changes
+        )
 
     try:
         print(f"PUBLISH_AT={publish_at}")
-        return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
+        return service.posts().insert(blogId=blog_id, body=insert_body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
         msg = str(exc)
@@ -324,9 +369,16 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         post_id = draft["id"]
         print(f"FALLBACK_REUSE_DRAFT={post_id} title={draft.get('title', '')[:60]}")
         publish_at = now_rfc3339_kst()
-        body["published"] = publish_at
         print(f"PUBLISH_AT={publish_at}")
-        _patch_with_label_fallback(service, blog_id, post_id, body)
+        _patch_with_label_fallback(
+            service,
+            blog_id,
+            post_id,
+            title=title,
+            content=content,
+            labels=labels,
+            published=publish_at,
+        )
         return service.posts().publish(blogId=blog_id, postId=post_id).execute()
 
 
