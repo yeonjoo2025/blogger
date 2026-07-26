@@ -9,7 +9,9 @@ from typing import Iterable
 MIN_BODY_CHARS = 2500
 MIN_LABELS = 15
 TARGET_LABELS = 20
-MAX_LABEL_CHARS_TOTAL = 180
+# Blogger rejects label sets well below the documented soft ceiling in practice.
+# Keep total label characters conservative so patch/insert with 15–20 labels succeeds.
+MAX_LABEL_CHARS_TOTAL = 90
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2
 
