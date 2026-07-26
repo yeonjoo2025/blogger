@@ -11,7 +11,7 @@ MIN_LABELS = 15
 TARGET_LABELS = 20
 # Blogger rejects label sets well below the documented soft ceiling in practice.
 # Keep total label characters conservative so patch/insert with 15–20 labels succeeds.
-MAX_LABEL_CHARS_TOTAL = 90
+MAX_LABEL_CHARS_TOTAL = 80
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2
 
@@ -169,9 +169,13 @@ def sanitize_labels(
             cleaned.insert(0, lab)
 
     # Fit Blogger practical limits: count + total chars.
+    # Prefer shorter tokens so we can keep 15–20 labels under the budget.
+    priority = cleaned[:3]
+    rest = sorted(cleaned[3:], key=lambda x: (len(x), x))
+    ordered = priority + [lab for lab in rest if lab not in priority]
     out: list[str] = []
     total = 0
-    for lab in cleaned:
+    for lab in ordered:
         add = len(lab) + (1 if out else 0)
         if len(out) >= target:
             break
@@ -181,18 +185,19 @@ def sanitize_labels(
         total += add
 
     # Pad with short topical tokens if under minimum.
-    pads = ["일정", "확인", "방법", "체크리스트", "공식", "신청", "비교", "가이드", "주의", "FAQ"]
+    pads = ["일정", "확인", "방법", "체크", "공식", "신청", "비교", "가이드", "주의", "FAQ", "팁", "정리"]
     for lab in pads:
         if len(out) >= target:
             break
         key = normalize_text(lab)
         if key in seen:
             continue
-        if total + len(lab) + 1 > MAX_LABEL_CHARS_TOTAL:
+        add = len(lab) + (1 if out else 0)
+        if total + add > MAX_LABEL_CHARS_TOTAL:
             continue
         seen.add(key)
         out.append(lab)
-        total += len(lab) + 1
+        total += add
     return out
 
 
