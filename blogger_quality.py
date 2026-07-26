@@ -8,7 +8,7 @@ from typing import Iterable
 
 MIN_BODY_CHARS = 2500
 MIN_LABELS = 15
-TARGET_LABELS = 20
+TARGET_LABELS = 19  # Blogger patch/update may 400 on 20 labels
 MAX_LABEL_CHARS_TOTAL = 180
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2
@@ -89,7 +89,10 @@ def classify_category(title: str, body: str = "") -> str:
         text,
     ):
         return "finance"
-    if re.search(r"근저당|사관|황강|홈플러스|이관|법원|벌금|제도|세금", text):
+    if re.search(
+        r"근저당|사관|황강|홈플러스|이관|법원|벌금|제도|세금|부신|증후군|증상|치료|병원|내분비|질환|건강정보",
+        text,
+    ):
         return "society"
     if HARD_SKIP_RE.search(text) and not HARD_SKIP_ALLOW_RE.search(text):
         return "sports_ent"
