@@ -8,8 +8,17 @@ from typing import Iterable
 
 MIN_BODY_CHARS = 2500
 MIN_LABELS = 15
-TARGET_LABELS = 20
+TARGET_LABELS = 19  # Blogger may reject patch/update with 20 labels
 MAX_LABEL_CHARS_TOTAL = 180
+
+
+def fit_labels_for_blogger(labels: list[str], max_count: int = TARGET_LABELS) -> list[str]:
+    """Shrink labels for Blogger limits: prefer dropping longer tokens first."""
+    out = list(labels[:max_count])
+    while len(out) > MIN_LABELS and sum(len(x) for x in out) + max(len(out) - 1, 0) > MAX_LABEL_CHARS_TOTAL:
+        longest = max(range(len(out)), key=lambda i: len(out[i]))
+        out.pop(longest)
+    return out[:max_count]
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2
 
@@ -89,7 +98,10 @@ def classify_category(title: str, body: str = "") -> str:
         text,
     ):
         return "finance"
-    if re.search(r"근저당|사관|황강|홈플러스|이관|법원|벌금|제도|세금", text):
+    if re.search(
+        r"근저당|사관|황강|홈플러스|이관|법원|벌금|제도|세금|폭염|온열|위기경보|중대본|재난",
+        text,
+    ):
         return "society"
     if HARD_SKIP_RE.search(text) and not HARD_SKIP_ALLOW_RE.search(text):
         return "sports_ent"
