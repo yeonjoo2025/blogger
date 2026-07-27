@@ -98,7 +98,10 @@ def classify_category(title: str, body: str = "") -> str:
         text,
     ):
         return "finance"
-    if re.search(r"근저당|사관|황강|홈플러스|이관|법원|벌금|제도|세금", text):
+    if re.search(
+        r"근저당|사관|황강|홈플러스|이관|법원|벌금|제도|세금|폭염|온열|위기경보|중대본|재난",
+        text,
+    ):
         return "society"
     if HARD_SKIP_RE.search(text) and not HARD_SKIP_ALLOW_RE.search(text):
         return "sports_ent"
