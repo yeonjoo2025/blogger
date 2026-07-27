@@ -8,8 +8,21 @@ from typing import Iterable
 
 MIN_BODY_CHARS = 2500
 MIN_LABELS = 15
-TARGET_LABELS = 20
+TARGET_LABELS = 19  # Blogger patch/update may 400 on 20 labels
 MAX_LABEL_CHARS_TOTAL = 180
+
+
+def fit_labels_for_blogger(labels: list[str], max_count: int = TARGET_LABELS) -> list[str]:
+    """Shrink label list for Blogger limits (prefer shorter tokens)."""
+    if len(labels) <= max_count:
+        return labels[:max_count]
+    # Drop longest first while keeping order of survivors.
+    indexed = list(enumerate(labels))
+    while len(indexed) > max_count:
+        longest_i = max(range(len(indexed)), key=lambda i: len(indexed[i][1]))
+        indexed.pop(longest_i)
+    indexed.sort(key=lambda t: t[0])
+    return [lab for _, lab in indexed]
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2
 
