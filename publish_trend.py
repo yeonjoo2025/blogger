@@ -186,8 +186,8 @@ def now_kst_rfc3339() -> str:
 
 
 def fit_labels_for_blogger(labels: list[str]) -> list[list[str]]:
-    """Return label-size attempts: 19 → 17 → 15 (Blogger may 400 on ~18-20)."""
-    clean = labels[: max(TARGET_LABELS - 1, MIN_LABELS)]
+    """Return label-size attempts: 19 → 17 → 15 (Blogger may 400 on 20 / some 18+)."""
+    clean = [x for x in labels if x][:TARGET_LABELS]
     attempts = []
     for n in (19, 17, 15):
         if len(clean) >= MIN_LABELS:
@@ -203,7 +203,7 @@ def fit_labels_for_blogger(labels: list[str]) -> list[list[str]]:
             continue
         seen.add(key)
         out.append(a)
-    return out or [labels[:MIN_LABELS]]
+    return out or [clean[:MIN_LABELS]]
 
 
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
