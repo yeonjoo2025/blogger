@@ -156,37 +156,54 @@ def find_reusable_draft(service, blog_id: str, title: str) -> dict | None:
       a) draft whose title already exists as LIVE (duplicate draft)
       b) hard-skip sports/entertainment draft
       c) oldest draft
+      d) if no drafts: revert a LIVE hard-skip sports/ent post to DRAFT, then reuse
     """
     drafts = _list_posts(service, blog_id, "DRAFT", limit=50)
-    if not drafts:
-        return None
-    live_titles = {((p.get("title") or "").strip()) for p in _list_posts(service, blog_id, "LIVE", limit=50)}
-
-    dupes = []
-    hard = []
-    for d in drafts:
-        dt = (d.get("title") or "").strip()
-        if dt and dt in live_titles:
-            dupes.append(d)
-            continue
-        skip, _ = is_hard_skip(dt, dt)
-        if skip:
-            hard.append(d)
+    live_posts = _list_posts(service, blog_id, "LIVE", limit=50)
+    live_titles = {((p.get("title") or "").strip()) for p in live_posts}
 
     def oldest(posts: list[dict]) -> dict:
         return sorted(posts, key=lambda p: p.get("updated") or p.get("published") or "")[0]
 
-    if dupes:
-        pick = oldest(dupes)
-        print(f"FALLBACK_REUSE_DRAFT={pick.get('id')} reason=duplicate_live_title")
+    if drafts:
+        dupes = []
+        hard = []
+        for d in drafts:
+            dt = (d.get("title") or "").strip()
+            if dt and dt in live_titles:
+                dupes.append(d)
+                continue
+            skip, _ = is_hard_skip(dt, dt)
+            if skip:
+                hard.append(d)
+
+        if dupes:
+            pick = oldest(dupes)
+            print(f"FALLBACK_REUSE_DRAFT={pick.get('id')} reason=duplicate_live_title")
+            return pick
+        if hard:
+            pick = oldest(hard)
+            print(f"FALLBACK_REUSE_DRAFT={pick.get('id')} reason=hard_skip_topic")
+            return pick
+        pick = oldest(drafts)
+        print(f"FALLBACK_REUSE_DRAFT={pick.get('id')} reason=oldest_draft")
         return pick
-    if hard:
-        pick = oldest(hard)
-        print(f"FALLBACK_REUSE_DRAFT={pick.get('id')} reason=hard_skip_topic")
-        return pick
-    pick = oldest(drafts)
-    print(f"FALLBACK_REUSE_DRAFT={pick.get('id')} reason=oldest_draft")
-    return pick
+
+    # No drafts left: reclaim a LIVE hard-skip sports/entertainment post as DRAFT.
+    reclaim = []
+    for p in live_posts:
+        pt = (p.get("title") or "").strip()
+        skip, _ = is_hard_skip(pt, pt)
+        if skip:
+            reclaim.append(p)
+    if not reclaim:
+        return None
+    target = oldest(reclaim)
+    post_id = target["id"]
+    print(f"FALLBACK_REVERT_LIVE={post_id} title={(target.get('title') or '')[:60]}")
+    reverted = service.posts().revert(blogId=blog_id, postId=post_id).execute()
+    print(f"FALLBACK_REUSE_DRAFT={reverted.get('id')} reason=reverted_hard_skip_live")
+    return reverted
 
 
 def now_rfc3339_kst() -> str:
