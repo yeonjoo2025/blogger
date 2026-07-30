@@ -271,35 +271,48 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
         return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
 
-    try:
-        return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
-    except Exception as exc:
-        err = str(exc)
-        print(f"INSERT_FAIL={exc}")
-        if "403" not in err and "429" not in err and "quota" not in err.lower():
-            print("생성/업데이트 없이 종료 (insert failed, not quota)")
-            raise SystemExit(0) from exc
-        draft = find_reusable_draft(service, blog_id, title)
-        if not draft:
-            print("생성/업데이트 없이 종료 (insert blocked and no reusable DRAFT)")
-            raise SystemExit(0) from exc
-        post_id = draft["id"]
-        print(f"FALLBACK_REUSE_DRAFT={post_id} prev_title={(draft.get('title') or '')[:80]}")
-        body_pub = dict(body)
-        body_pub["published"] = kst_now_rfc3339()
-        print(f"PUBLISH_AT={body_pub['published']}")
-        # Retry with shrinking labels if Blogger rejects 20 labels.
-        last_exc: Exception | None = None
-        for n in (19, 18, 17, 16, 15):
-            body_pub["labels"] = labels[:n]
-            try:
-                service.posts().update(blogId=blog_id, postId=post_id, body=body_pub).execute()
-                return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-            except Exception as patch_exc:
-                last_exc = patch_exc
-                print(f"DRAFT_UPDATE_RETRY labels={n} err={patch_exc}")
-        print("생성/업데이트 없이 종료 (DRAFT reuse failed)")
-        raise SystemExit(0) from last_exc
+    import time
+
+    last_insert_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
+        except Exception as exc:
+            last_insert_exc = exc
+            err = str(exc)
+            print(f"INSERT_FAIL={exc}")
+            transient = any(x in err for x in ("503", "500", "backendError", "unavailable", "timed out", "Timeout"))
+            quotaish = any(x in err.lower() for x in ("403", "429", "quota", "rateLimit"))
+            if transient and attempt < 3:
+                print(f"INSERT_RETRY attempt={attempt}")
+                time.sleep(2 * attempt)
+                continue
+            if not (quotaish or transient):
+                print("생성/업데이트 없이 종료 (insert failed, not quota/transient)")
+                raise SystemExit(0) from exc
+            break
+
+    draft = find_reusable_draft(service, blog_id, title)
+    if not draft:
+        print("생성/업데이트 없이 종료 (insert blocked and no reusable DRAFT)")
+        raise SystemExit(0) from last_insert_exc
+    post_id = draft["id"]
+    print(f"FALLBACK_REUSE_DRAFT={post_id} prev_title={(draft.get('title') or '')[:80]}")
+    body_pub = dict(body)
+    body_pub["published"] = kst_now_rfc3339()
+    print(f"PUBLISH_AT={body_pub['published']}")
+    # Retry with shrinking labels if Blogger rejects 20 labels.
+    last_exc: Exception | None = None
+    for n in (19, 18, 17, 16, 15):
+        body_pub["labels"] = labels[:n]
+        try:
+            service.posts().update(blogId=blog_id, postId=post_id, body=body_pub).execute()
+            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+        except Exception as patch_exc:
+            last_exc = patch_exc
+            print(f"DRAFT_UPDATE_RETRY labels={n} err={patch_exc}")
+    print("생성/업데이트 없이 종료 (DRAFT reuse failed)")
+    raise SystemExit(0) from last_exc
 
 
 def maybe_score_with_stats(category: str) -> None:
