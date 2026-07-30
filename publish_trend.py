@@ -133,6 +133,67 @@ def find_empty_shell(service, blog_id: str) -> dict | None:
     return None
 
 
+def _list_posts(service, blog_id: str, status: str, limit: int = 50) -> list[dict]:
+    items: list[dict] = []
+    req = service.posts().list(
+        blogId=blog_id,
+        status=status,
+        maxResults=min(limit, 50),
+        fetchBodies=True,
+        view="ADMIN",
+    )
+    while req is not None and len(items) < limit:
+        resp = req.execute()
+        items.extend(resp.get("items") or [])
+        req = service.posts().list_next(req, resp)
+    return items[:limit]
+
+
+def find_reusable_draft(service, blog_id: str, title: str) -> dict | None:
+    """Pick a DRAFT to overwrite when insert is blocked (403/429).
+
+    Priority:
+      a) draft whose title already exists as LIVE (duplicate draft)
+      b) hard-skip sports/entertainment draft
+      c) oldest draft
+    """
+    drafts = _list_posts(service, blog_id, "DRAFT", limit=50)
+    if not drafts:
+        return None
+    live_titles = {
+        (p.get("title") or "").strip()
+        for p in _list_posts(service, blog_id, "LIVE", limit=50)
+    }
+    live_titles.discard("")
+
+    dupes = []
+    hard = []
+    for d in drafts:
+        dt = (d.get("title") or "").strip()
+        if dt and dt in live_titles:
+            dupes.append(d)
+            continue
+        skip, _ = is_hard_skip(dt, dt)
+        if skip:
+            hard.append(d)
+
+    def _published_key(post: dict) -> str:
+        return post.get("published") or post.get("updated") or post.get("id") or ""
+
+    for group in (dupes, hard, drafts):
+        if group:
+            return sorted(group, key=_published_key)[0]
+    return None
+
+
+def kst_now_rfc3339() -> str:
+    # Blogger expects RFC3339; use KST offset for operator mental model.
+    from datetime import timezone, timedelta
+
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).isoformat(timespec="seconds")
+
+
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
     resp = (
         service.posts()
@@ -186,30 +247,86 @@ def build_content(body: str, thumb: str) -> str:
     return thumb_html + html
 
 
+def _fit_labels_for_blogger(labels: list[str]) -> list[list[str]]:
+    """Return label batches to try: 19 → 15 (Blogger may 400 on 20)."""
+    clean = labels[:19]
+    batches = [clean]
+    if len(clean) > 15:
+        batches.append(clean[:15])
+    return batches
+
+
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_empty_shell(service, blog_id)
-    body = {
-        "kind": "blogger#post",
-        "blog": {"id": blog_id},
-        "title": title,
-        "content": content,
-        "labels": labels,
-    }
+    label_batches = _fit_labels_for_blogger(labels)
+
+    def _body(labs: list[str], with_published: bool = False) -> dict:
+        body = {
+            "kind": "blogger#post",
+            "blog": {"id": blog_id},
+            "title": title,
+            "content": content,
+            "labels": labs,
+        }
+        if with_published:
+            body["published"] = kst_now_rfc3339()
+            print(f"PUBLISH_AT={body['published']}")
+        return body
+
     if shell:
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
-        if status == "DRAFT":
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
-            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+        last_exc: Exception | None = None
+        for labs in label_batches:
+            try:
+                if status == "DRAFT":
+                    service.posts().patch(
+                        blogId=blog_id, postId=post_id, body=_body(labs, with_published=True)
+                    ).execute()
+                    return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+                return service.posts().patch(
+                    blogId=blog_id, postId=post_id, body=_body(labs)
+                ).execute()
+            except Exception as exc:  # noqa: BLE001 — retry smaller label set
+                last_exc = exc
+                print(f"SHELL_PATCH_FAIL labels={len(labs)} err={exc}")
+        if last_exc:
+            raise last_exc
 
     try:
-        return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
+        return service.posts().insert(
+            blogId=blog_id, body=_body(label_batches[0]), isDraft=False
+        ).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
-        raise SystemExit(0) from exc
+        err = str(exc)
+        if "403" not in err and "429" not in err and "quota" not in err.lower():
+            print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
+            raise SystemExit(0) from exc
+
+        draft = find_reusable_draft(service, blog_id, title)
+        if not draft:
+            print("FALLBACK_REUSE_DRAFT=none")
+            print("생성/업데이트 없이 종료 (insert blocked and no reusable draft)")
+            raise SystemExit(0) from exc
+
+        post_id = draft["id"]
+        print(f"FALLBACK_REUSE_DRAFT={post_id} title={(draft.get('title') or '')[:80]}")
+        last_exc = None
+        for labs in label_batches:
+            try:
+                service.posts().update(
+                    blogId=blog_id,
+                    postId=post_id,
+                    body=_body(labs, with_published=True),
+                ).execute()
+                return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+            except Exception as exc2:  # noqa: BLE001
+                last_exc = exc2
+                print(f"DRAFT_UPDATE_FAIL labels={len(labs)} err={exc2}")
+        print("생성/업데이트 없이 종료 (draft reuse failed)")
+        raise SystemExit(0) from (last_exc or exc)
 
 
 def maybe_score_with_stats(category: str) -> None:
