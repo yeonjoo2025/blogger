@@ -133,6 +133,87 @@ def find_empty_shell(service, blog_id: str) -> dict | None:
     return None
 
 
+def _list_posts(service, blog_id: str, status: str, limit: int = 50) -> list[dict]:
+    items: list[dict] = []
+    req = service.posts().list(
+        blogId=blog_id,
+        status=status,
+        maxResults=min(limit, 50),
+        fetchBodies=True,
+        view="ADMIN",
+    )
+    while req is not None and len(items) < limit:
+        resp = req.execute()
+        items.extend(resp.get("items") or [])
+        req = service.posts().list_next(req, resp)
+    return items[:limit]
+
+
+def find_reusable_draft(service, blog_id: str, title: str) -> dict | None:
+    """Pick a DRAFT to overwrite when insert is blocked (403/429) and no empty shell.
+
+    Priority:
+      a) draft whose title already exists as LIVE (duplicate draft)
+      b) hard-skip sports/entertainment draft
+      c) oldest draft
+      d) if no drafts: revert a LIVE hard-skip sports/ent post to DRAFT, then reuse
+    """
+    drafts = _list_posts(service, blog_id, "DRAFT", limit=50)
+    live_posts = _list_posts(service, blog_id, "LIVE", limit=50)
+    live_titles = {((p.get("title") or "").strip()) for p in live_posts}
+
+    def oldest(posts: list[dict]) -> dict:
+        return sorted(posts, key=lambda p: p.get("updated") or p.get("published") or "")[0]
+
+    if drafts:
+        dupes = []
+        hard = []
+        for d in drafts:
+            dt = (d.get("title") or "").strip()
+            if dt and dt in live_titles:
+                dupes.append(d)
+                continue
+            skip, _ = is_hard_skip(dt, dt)
+            if skip:
+                hard.append(d)
+
+        if dupes:
+            pick = oldest(dupes)
+            print(f"FALLBACK_REUSE_DRAFT={pick.get('id')} reason=duplicate_live_title")
+            return pick
+        if hard:
+            pick = oldest(hard)
+            print(f"FALLBACK_REUSE_DRAFT={pick.get('id')} reason=hard_skip_topic")
+            return pick
+        pick = oldest(drafts)
+        print(f"FALLBACK_REUSE_DRAFT={pick.get('id')} reason=oldest_draft")
+        return pick
+
+    # No drafts left: reclaim a LIVE hard-skip sports/entertainment post as DRAFT.
+    reclaim = []
+    for p in live_posts:
+        pt = (p.get("title") or "").strip()
+        skip, _ = is_hard_skip(pt, pt)
+        if skip:
+            reclaim.append(p)
+    if not reclaim:
+        return None
+    target = oldest(reclaim)
+    post_id = target["id"]
+    print(f"FALLBACK_REVERT_LIVE={post_id} title={(target.get('title') or '')[:60]}")
+    reverted = service.posts().revert(blogId=blog_id, postId=post_id).execute()
+    print(f"FALLBACK_REUSE_DRAFT={reverted.get('id')} reason=reverted_hard_skip_live")
+    return reverted
+
+
+def now_rfc3339_kst() -> str:
+    # Blogger accepts RFC3339; use KST (+09:00) for operator-visible publish time.
+    from datetime import timedelta, timezone
+
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).isoformat(timespec="seconds")
+
+
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
     resp = (
         service.posts()
@@ -188,28 +269,59 @@ def build_content(body: str, thumb: str) -> str:
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_empty_shell(service, blog_id)
+    publish_at = now_rfc3339_kst()
     body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
         "title": title,
         "content": content,
         "labels": labels,
+        "published": publish_at,
     }
+    print(f"PUBLISH_AT={publish_at}")
+
+    def patch_and_publish(post_id: str, *, as_draft: bool) -> dict:
+        # Retry labels 19→15 if Blogger rejects oversized label sets.
+        last_exc: Exception | None = None
+        for n in (len(labels), 19, 18, 17, 16, 15):
+            if n > len(labels):
+                continue
+            attempt = dict(body)
+            attempt["labels"] = labels[:n]
+            try:
+                service.posts().patch(blogId=blog_id, postId=post_id, body=attempt).execute()
+                if as_draft:
+                    return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+                return service.posts().get(blogId=blog_id, postId=post_id, view="ADMIN").execute()
+            except Exception as exc:  # noqa: BLE001 - need label shrink retry
+                last_exc = exc
+                msg = str(exc)
+                if "label" in msg.lower() or "400" in msg or "Invalid" in msg:
+                    print(f"LABELS_RETRY n={n} err={msg[:160]}")
+                    continue
+                raise
+        raise SystemExit(f"LABELS_PATCH_FAIL={last_exc}")
+
     if shell:
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
-        if status == "DRAFT":
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
-            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+        return patch_and_publish(post_id, as_draft=(status == "DRAFT"))
 
     try:
         return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
-        raise SystemExit(0) from exc
+        err = str(exc)
+        if "403" not in err and "429" not in err and "quota" not in err.lower():
+            print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
+            raise SystemExit(0) from exc
+        draft = find_reusable_draft(service, blog_id, title)
+        if not draft:
+            print("생성/업데이트 없이 종료 (insert blocked and no reusable draft)")
+            raise SystemExit(0) from exc
+        post_id = draft["id"]
+        return patch_and_publish(post_id, as_draft=True)
 
 
 def maybe_score_with_stats(category: str) -> None:
