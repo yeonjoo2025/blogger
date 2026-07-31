@@ -251,20 +251,47 @@ def build_content(body: str, thumb: str) -> str:
 
 
 def _fit_labels_retry(service, blog_id: str, post_id: str, body: dict, labels: list[str]):
-    """Patch with labels; if Blogger rejects count, shrink 19→15 and retry."""
+    """Patch with labels; if Blogger rejects, shrink count and prefer shorter tokens."""
+    from blogger_quality import MAX_LABEL_CHARS_TOTAL
+
     last_exc: Exception | None = None
+    # Prefer short labels first so 15+ fit under total-char budget.
+    ranked = sorted(dict.fromkeys(labels), key=lambda x: (len(x), x))
+    candidates: list[list[str]] = []
     for n in (len(labels), 19, 18, 17, 16, 15):
         if n < MIN_LABELS:
-            break
+            continue
+        candidates.append(labels[:n])
+        short: list[str] = []
+        total = 0
+        for lab in ranked:
+            add = len(lab) + (1 if short else 0)
+            if total + add > MAX_LABEL_CHARS_TOTAL:
+                continue
+            short.append(lab)
+            total += add
+            if len(short) >= n:
+                break
+        if len(short) >= MIN_LABELS:
+            candidates.append(short[:n])
+
+    seen: set[tuple[str, ...]] = set()
+    for labs in candidates:
+        key = tuple(labs)
+        if key in seen:
+            continue
+        seen.add(key)
         attempt = dict(body)
-        attempt["labels"] = labels[:n]
+        attempt["labels"] = labs
         try:
-            return service.posts().patch(blogId=blog_id, postId=post_id, body=attempt).execute()
+            resp = service.posts().patch(blogId=blog_id, postId=post_id, body=attempt).execute()
+            print(f"LABELS_APPLIED n={len(labs)} chars={sum(len(x) for x in labs)+max(0,len(labs)-1)}")
+            return resp
         except Exception as exc:
             last_exc = exc
             msg = str(exc)
-            if "400" in msg or "label" in msg.lower() or "Invalid" in msg:
-                print(f"LABELS_RETRY n={n} err={msg[:160]}")
+            if "400" in msg or "label" in msg.lower() or "Invalid" in msg or "invalid" in msg:
+                print(f"LABELS_RETRY n={len(labs)} err={msg[:160]}")
                 continue
             raise
     if last_exc:
