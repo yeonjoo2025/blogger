@@ -24,6 +24,8 @@ from blogger_http import build_blogger_service
 from blogger_quality import (
     MIN_LABELS,
     TARGET_LABELS,
+    HARD_SKIP_RE,
+    HARD_SKIP_ALLOW_RE,
     is_hard_skip,
     sanitize_labels,
     validate_post,
@@ -41,6 +43,8 @@ POSTS_DIR = Path("posts")
 REQUIRE_AI_THUMB = os.environ.get("BLOGGER_REQUIRE_AI_THUMB", "1") != "0"
 ALLOW_PILLOW = os.environ.get("BLOGGER_ALLOW_PILLOW_THUMB", "") == "1"
 AUTO_GIT_PUSH = os.environ.get("BLOGGER_AUTO_GIT_PUSH", "1") != "0"
+# Blogger patch/update can reject 20 labels; keep a practical max of 19.
+BLOGGER_LABEL_MAX = int(os.environ.get("BLOGGER_LABEL_MAX", "19"))
 
 
 def slugify(text: str) -> str:
@@ -133,6 +137,133 @@ def find_empty_shell(service, blog_id: str) -> dict | None:
     return None
 
 
+def _kst_now_rfc3339() -> str:
+    # Blogger accepts RFC3339; publish timestamp in KST (+09:00).
+    from datetime import timedelta, timezone
+
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).isoformat(timespec="seconds")
+
+
+def fit_labels_for_blogger(labels: list[str], maximum: int = BLOGGER_LABEL_MAX) -> list[str]:
+    """Shrink label list for Blogger patch/update limits (prefer <=19)."""
+    maximum = max(MIN_LABELS, min(maximum, TARGET_LABELS))
+    out = list(labels[:maximum])
+    # Drop longest tokens first if somehow over-count remains.
+    while len(out) > maximum:
+        longest = max(range(len(out)), key=lambda i: len(out[i]))
+        out.pop(longest)
+    return out
+
+
+def _list_posts(service, blog_id: str, status: str, limit: int = 50) -> list[dict]:
+    items: list[dict] = []
+    req = service.posts().list(
+        blogId=blog_id,
+        status=status,
+        maxResults=min(limit, 50),
+        fetchBodies=True,
+        view="ADMIN",
+    )
+    while req is not None and len(items) < limit:
+        resp = req.execute()
+        items.extend(resp.get("items") or [])
+        req = service.posts().list_next(req, resp)
+    return items[:limit]
+
+
+def list_drafts(service, blog_id: str, limit: int = 50) -> list[dict]:
+    return _list_posts(service, blog_id, "DRAFT", limit=limit)
+
+
+def find_reusable_draft(service, blog_id: str, title: str, live_titles: list[str]) -> dict | None:
+    """Pick a post slot to overwrite when insert is blocked.
+
+    Priority:
+      a) draft whose title already exists as LIVE (duplicate draft)
+      b) hard-skip entertainment/sports draft
+      c) oldest draft
+      d) no drafts: LIVE hard-skip sports/ent (revert→DRAFT)
+      e) still none: oldest short LIVE post (revert→DRAFT) to clear insert quota deadlock
+    """
+    drafts = list_drafts(service, blog_id)
+    live_posts = _list_posts(service, blog_id, "LIVE", limit=50)
+    live_norm = {re.sub(r"\s+", "", (t or "").lower()) for t in live_titles}
+    for p in live_posts:
+        live_norm.add(re.sub(r"\s+", "", (p.get("title") or "").lower()))
+
+    def is_dup(d: dict) -> bool:
+        t = re.sub(r"\s+", "", (d.get("title") or "").lower())
+        return bool(t) and t in live_norm
+
+    def is_hard_topic(d: dict) -> bool:
+        text = f"{d.get('title') or ''}"
+        skip, _ = is_hard_skip(text, text)
+        return skip
+
+    def updated_key(d: dict) -> str:
+        return d.get("updated") or d.get("published") or ""
+
+    def oldest(posts: list[dict]) -> dict:
+        posts = sorted(posts, key=updated_key)
+        return posts[0]
+
+    if drafts:
+        for pred, reason in ((is_dup, "duplicate_live_title"), (is_hard_topic, "hard_skip_topic")):
+            matched = [d for d in drafts if pred(d)]
+            if matched:
+                pick = oldest(matched)
+                print(f"FALLBACK_REUSE_DRAFT={pick.get('id')} reason={reason}")
+                return pick
+        pick = oldest(drafts)
+        print(f"FALLBACK_REUSE_DRAFT={pick.get('id')} reason=oldest_draft")
+        return pick
+
+    # No DRAFT slots: reclaim LIVE hard-skip, else oldest short LIVE.
+    live_hard = [p for p in live_posts if is_hard_topic(p)]
+    target = None
+    reason = ""
+    if live_hard:
+        target = oldest(live_hard)
+        reason = "reverted_hard_skip_live"
+    else:
+        scored: list[tuple[int, dict]] = []
+        for p in live_posts:
+            text = re.sub(r"<[^>]+>", "", p.get("content") or "").strip()
+            scored.append((len(text), p))
+        scored.sort(key=lambda x: (x[0], updated_key(x[1])))
+        # Prefer short/old posts; never touch posts updated in the last 12h.
+        from datetime import timedelta, timezone
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=12)
+        for _, p in scored:
+            raw = p.get("updated") or p.get("published") or ""
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except Exception:
+                dt = None
+            if dt and dt > cutoff:
+                continue
+            target = p
+            reason = "reverted_oldest_short_live"
+            break
+
+    if not target:
+        return None
+
+    post_id = target["id"]
+    print(
+        f"FALLBACK_REVERT_LIVE={post_id} title={(target.get('title') or '')[:60]} reason={reason}"
+    )
+    try:
+        reverted = service.posts().revert(blogId=blog_id, postId=post_id).execute()
+    except Exception as exc:
+        print(f"REVERT_FAIL={exc}")
+        return None
+    print(f"FALLBACK_REUSE_DRAFT={reverted.get('id')} reason={reason}")
+    return reverted
+
+
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
     resp = (
         service.posts()
@@ -186,30 +317,103 @@ def build_content(body: str, thumb: str) -> str:
     return thumb_html + html
 
 
-def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
+def _update_with_label_backoff(service, blog_id: str, post_id: str, body: dict) -> dict:
+    """Update post; omit kind/blog fields that can 400 on update; shrink labels on 400."""
+    labels = list(body.get("labels") or [])
+    last_exc: Exception | None = None
+    for max_n in (len(labels), 19, 18, 17, 16, 15):
+        if max_n < MIN_LABELS:
+            break
+        trial = {
+            "title": body["title"],
+            "content": body["content"],
+            "labels": fit_labels_for_blogger(labels, maximum=max_n),
+        }
+        if body.get("published"):
+            trial["published"] = body["published"]
+        try:
+            print(f"LABEL_TRY={len(trial['labels'])}")
+            return service.posts().update(blogId=blog_id, postId=post_id, body=trial).execute()
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            if "400" in msg or "label" in msg.lower():
+                print(f"LABEL_UPDATE_RETRY={max_n} err={msg[:160]}")
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
+def publish_or_patch(
+    service,
+    blog_id: str,
+    title: str,
+    content: str,
+    labels: list[str],
+    live_titles: list[str] | None = None,
+) -> dict:
+    labels = fit_labels_for_blogger(labels, maximum=BLOGGER_LABEL_MAX)
     shell = find_empty_shell(service, blog_id)
+    publish_at = _kst_now_rfc3339()
     body = {
-        "kind": "blogger#post",
-        "blog": {"id": blog_id},
         "title": title,
         "content": content,
         "labels": labels,
+        "published": publish_at,
     }
     if shell:
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
+        print(f"PUBLISH_AT={publish_at}")
         if status == "DRAFT":
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+            _update_with_label_backoff(service, blog_id, post_id, body)
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+        return _update_with_label_backoff(service, blog_id, post_id, body)
 
-    try:
-        return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
-    except Exception as exc:
-        print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
-        raise SystemExit(0) from exc
+    import time
+
+    last_insert_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            print(f"PUBLISH_AT={publish_at}")
+            insert_body = {
+                "kind": "blogger#post",
+                "blog": {"id": blog_id},
+                **body,
+            }
+            return service.posts().insert(blogId=blog_id, body=insert_body, isDraft=False).execute()
+        except Exception as exc:
+            last_insert_exc = exc
+            err = str(exc)
+            print(f"INSERT_FAIL={exc}")
+            transient = any(
+                x in err for x in ("503", "500", "backendError", "unavailable", "timed out", "Timeout")
+            )
+            quotaish = any(x in err.lower() for x in ("403", "429", "quota", "ratelimit", "forbidden"))
+            if transient and attempt < 3:
+                print(f"INSERT_RETRY attempt={attempt}")
+                time.sleep(2 * attempt)
+                continue
+            if not (quotaish or transient):
+                print("생성/업데이트 없이 종료 (insert failed, not quota/transient)")
+                raise SystemExit(0) from exc
+            break
+
+    draft = find_reusable_draft(service, blog_id, title, live_titles or [])
+    if not draft:
+        print("FALLBACK_REUSE_DRAFT=none")
+        print("생성/업데이트 없이 종료 (insert blocked and no reusable DRAFT/LIVE slot)")
+        raise SystemExit(0) from last_insert_exc
+
+    post_id = draft["id"]
+    prev_status = (draft.get("status") or "").upper()
+    print(f"PUBLISH_AT={publish_at}")
+    updated = _update_with_label_backoff(service, blog_id, post_id, body)
+    if prev_status == "DRAFT" or (updated.get("status") or "").upper() == "DRAFT":
+        return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+    return updated
 
 
 def maybe_score_with_stats(category: str) -> None:
@@ -296,7 +500,8 @@ def main() -> None:
     if len(labels) < MIN_LABELS:
         print(f"SKIP_LABELS: only {len(labels)} after sanitize (need {MIN_LABELS}+)")
         raise SystemExit(0)
-    labels = labels[:TARGET_LABELS]
+    labels = fit_labels_for_blogger(labels, maximum=BLOGGER_LABEL_MAX)
+    print(f"LABELS_FITTED={len(labels)}")
 
     # Thumbnail gate
     if REQUIRE_AI_THUMB and not ALLOW_PILLOW:
@@ -327,7 +532,7 @@ def main() -> None:
         print(f"LABELS={labels}")
         raise SystemExit(0)
 
-    post = publish_or_patch(service, BLOG_ID, title, content, labels)
+    post = publish_or_patch(service, BLOG_ID, title, content, labels, live_titles=titles)
     url = post.get("url")
     post_id = post.get("id")
     final_labels = post.get("labels") or []
