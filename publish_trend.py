@@ -239,9 +239,67 @@ def build_content(body: str, thumb: str) -> str:
     return thumb_html + html
 
 
+def fit_labels_for_blogger(labels: list[str]) -> list[str]:
+    """Shrink labels until likely accepted by Blogger patch/update."""
+    from blogger_quality import MAX_LABEL_CHARS_TOTAL
+
+    out = list(labels)[:19]
+    while out:
+        total = sum(len(x) for x in out) + max(0, len(out) - 1)
+        if len(out) <= 19 and total <= MAX_LABEL_CHARS_TOTAL and len(out) >= MIN_LABELS:
+            return out
+        # drop longest first
+        longest = max(range(len(out)), key=lambda i: len(out[i]))
+        if len(out) <= MIN_LABELS:
+            # still over char budget: drop longest even at minimum count
+            if total <= MAX_LABEL_CHARS_TOTAL:
+                return out
+            out.pop(longest)
+            continue
+        out.pop(longest)
+    return out
+
+
+def _apply_post(service, blog_id: str, post_id: str, body: dict, *, as_draft: bool) -> dict:
+    """Patch/update with label shrink retries on HTTP 400."""
+    labels = list(body.get("labels") or [])
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        body = dict(body)
+        body["labels"] = labels
+        try:
+            if as_draft:
+                service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+                return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+            return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            if "400" not in msg and "badRequest" not in msg:
+                raise
+            if len(labels) > MIN_LABELS:
+                # drop longest label and retry
+                longest = max(range(len(labels)), key=lambda i: len(labels[i]))
+                dropped = labels.pop(longest)
+                print(f"LABEL_RETRY_DROP={dropped} remain={len(labels)}")
+                continue
+            # last resort: try update instead of patch
+            try:
+                service.posts().update(blogId=blog_id, postId=post_id, body=body).execute()
+                if as_draft:
+                    return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+                return service.posts().get(blogId=blog_id, postId=post_id, view="ADMIN").execute()
+            except Exception:
+                raise last_exc from exc
+    assert last_exc is not None
+    raise last_exc
+
+
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
-    # Fit labels for Blogger (20 labels can 400 on patch/update).
-    labels = list(labels)[:19]
+    # Fit labels for Blogger (20 labels / long tokens can 400 on patch/update).
+    labels = fit_labels_for_blogger(list(labels)[:19])
+    if len(labels) < MIN_LABELS:
+        raise SystemExit(f"SKIP_LABELS: only {len(labels)} after fit (need {MIN_LABELS}+)")
     shell = find_empty_shell(service, blog_id)
     publish_at = kst_now_rfc3339()
     body = {
@@ -252,15 +310,13 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         "labels": labels,
         "published": publish_at,
     }
+    print(f"LABELS_FITTED={len(labels)} values={labels}")
     if shell:
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
         print(f"PUBLISH_AT={publish_at}")
-        if status == "DRAFT":
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
-            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+        return _apply_post(service, blog_id, post_id, body, as_draft=(status == "DRAFT"))
 
     try:
         print(f"PUBLISH_AT={publish_at}")
