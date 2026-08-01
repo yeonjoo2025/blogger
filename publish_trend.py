@@ -133,6 +133,86 @@ def find_empty_shell(service, blog_id: str) -> dict | None:
     return None
 
 
+def _kst_now_rfc3339() -> str:
+    # Blogger published timestamps: use KST offset explicitly.
+    from datetime import timedelta, timezone
+
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).isoformat(timespec="seconds")
+
+
+def find_reusable_draft(service, blog_id: str, title: str) -> dict | None:
+    """Pick a DRAFT to overwrite when insert is blocked (403/429).
+
+    Priority:
+      a) draft whose title already exists as LIVE (duplicate draft)
+      b) hard-skip (sports/ent) themed draft
+      c) oldest draft
+    """
+    live_resp = (
+        service.posts()
+        .list(blogId=blog_id, status="LIVE", maxResults=50, fetchBodies=False, view="ADMIN")
+        .execute()
+    )
+    live_titles = {(p.get("title") or "").strip() for p in (live_resp.get("items") or [])}
+
+    drafts: list[dict] = []
+    page_token = None
+    while True:
+        req = service.posts().list(
+            blogId=blog_id,
+            status="DRAFT",
+            maxResults=50,
+            fetchBodies=True,
+            view="ADMIN",
+            pageToken=page_token,
+        )
+        resp = req.execute()
+        drafts.extend(resp.get("items") or [])
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    if not drafts:
+        return None
+
+    dup = [d for d in drafts if (d.get("title") or "").strip() in live_titles and (d.get("title") or "").strip()]
+    if dup:
+        dup.sort(key=lambda d: d.get("updated") or d.get("published") or "")
+        return dup[0]
+
+    hard = []
+    for d in drafts:
+        t = d.get("title") or ""
+        skip, _ = is_hard_skip(t, t)
+        if skip:
+            hard.append(d)
+    if hard:
+        hard.sort(key=lambda d: d.get("updated") or d.get("published") or "")
+        return hard[0]
+
+    drafts.sort(key=lambda d: d.get("updated") or d.get("published") or "")
+    return drafts[0]
+
+
+def reuse_draft_and_publish(
+    service, blog_id: str, draft: dict, title: str, content: str, labels: list[str]
+) -> dict:
+    post_id = draft["id"]
+    published = _kst_now_rfc3339()
+    body = {
+        "kind": "blogger#post",
+        "blog": {"id": blog_id},
+        "title": title,
+        "content": content,
+        "labels": labels,
+        "published": published,
+    }
+    print(f"FALLBACK_REUSE_DRAFT={post_id}")
+    print(f"PUBLISH_AT={published}")
+    service.posts().update(blogId=blog_id, postId=post_id, body=body).execute()
+    return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+
+
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
     resp = (
         service.posts()
@@ -187,6 +267,7 @@ def build_content(body: str, thumb: str) -> str:
 
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
+    # Prefer empty LIVE/DRAFT shell patch → publish; insert only if no shell.
     shell = find_empty_shell(service, blog_id)
     body = {
         "kind": "blogger#post",
@@ -200,6 +281,9 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
         if status == "DRAFT":
+            published = _kst_now_rfc3339()
+            body["published"] = published
+            print(f"PUBLISH_AT={published}")
             service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
         return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
@@ -208,8 +292,13 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
-        raise SystemExit(0) from exc
+        msg = str(exc)
+        if "403" in msg or "429" in msg or "quota" in msg.lower() or "rate" in msg.lower():
+            draft = find_reusable_draft(service, blog_id, title)
+            if draft:
+                return reuse_draft_and_publish(service, blog_id, draft, title, content, labels)
+        print("생성/업데이트 없이 종료 (insert blocked and no reusable draft)")
+        raise SystemExit(1) from exc
 
 
 def maybe_score_with_stats(category: str) -> None:
@@ -296,7 +385,8 @@ def main() -> None:
     if len(labels) < MIN_LABELS:
         print(f"SKIP_LABELS: only {len(labels)} after sanitize (need {MIN_LABELS}+)")
         raise SystemExit(0)
-    labels = labels[:TARGET_LABELS]
+    # Cap at 19; if Blogger rejects, shrink toward MIN_LABELS.
+    labels = labels[: min(TARGET_LABELS, 19)]
 
     # Thumbnail gate
     if REQUIRE_AI_THUMB and not ALLOW_PILLOW:
