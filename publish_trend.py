@@ -266,37 +266,85 @@ def build_content(body: str, thumb: str) -> str:
     return thumb_html + html
 
 
+def _label_attempts(labels: list[str]) -> list[list[str]]:
+    """Shrink label sets for Blogger 400s (count/total-char limits vary)."""
+    seen: list[list[str]] = []
+    for n in (19, 17, 15):
+        chunk = labels[:n]
+        if chunk and chunk not in seen:
+            seen.append(chunk)
+    if labels and labels not in seen:
+        seen.insert(0, labels[:19])
+    return seen
+
+
+def _apply_post(service, blog_id: str, post_id: str | None, title: str, content: str, labels: list[str], *, as_insert: bool = False):
+    last_exc = None
+    for attempt in _label_attempts(labels):
+        body = {
+            "kind": "blogger#post",
+            "blog": {"id": blog_id},
+            "title": title,
+            "content": content,
+            "labels": attempt,
+        }
+        try:
+            if as_insert:
+                return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute(), attempt
+            assert post_id
+            published = _kst_now_rfc3339()
+            body["published"] = published
+            print(f"PUBLISH_AT={published}")
+            print(f"LABELS_ATTEMPT={len(attempt)}")
+            service.posts().update(blogId=blog_id, postId=post_id, body=body).execute()
+            # If it was a DRAFT shell, publish; LIVE patch/update is already live.
+            cur = service.posts().get(blogId=blog_id, postId=post_id, view="ADMIN").execute()
+            if (cur.get("status") or "").upper() == "DRAFT":
+                return service.posts().publish(blogId=blog_id, postId=post_id).execute(), attempt
+            return cur, attempt
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            if "400" in msg or "badRequest" in msg:
+                print(f"LABELS_RETRY_AFTER_400 count={len(attempt)}")
+                continue
+            raise
+    raise last_exc  # type: ignore[misc]
+
+
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
-    # Prefer empty LIVE/DRAFT shell patch → publish; insert only if no shell.
+    # Prefer empty LIVE/DRAFT shell update → publish; insert only if no shell.
     shell = find_empty_shell(service, blog_id)
-    body = {
-        "kind": "blogger#post",
-        "blog": {"id": blog_id},
-        "title": title,
-        "content": content,
-        "labels": labels,
-    }
     if shell:
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
-        if status == "DRAFT":
-            published = _kst_now_rfc3339()
-            body["published"] = published
-            print(f"PUBLISH_AT={published}")
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
-            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+        post, used = _apply_post(service, blog_id, post_id, title, content, labels, as_insert=False)
+        print(f"labels_count={len(used)}")
+        return post
 
     try:
-        return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
+        post, used = _apply_post(service, blog_id, None, title, content, labels, as_insert=True)
+        print(f"labels_count={len(used)}")
+        return post
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
         msg = str(exc)
-        if "403" in msg or "429" in msg or "quota" in msg.lower() or "rate" in msg.lower():
+        if "403" in msg or "429" in msg or "quota" in msg.lower() or "rate" in msg.lower() or "400" in msg:
             draft = find_reusable_draft(service, blog_id, title)
             if draft:
-                return reuse_draft_and_publish(service, blog_id, draft, title, content, labels)
+                # reuse_draft already publishes; retry labels inside
+                last = None
+                for attempt in _label_attempts(labels):
+                    try:
+                        return reuse_draft_and_publish(service, blog_id, draft, title, content, attempt)
+                    except Exception as e2:
+                        last = e2
+                        if "400" in str(e2):
+                            print(f"LABELS_RETRY_AFTER_400 count={len(attempt)}")
+                            continue
+                        raise
+                raise last  # type: ignore[misc]
         print("생성/업데이트 없이 종료 (insert blocked and no reusable draft)")
         raise SystemExit(1) from exc
 
