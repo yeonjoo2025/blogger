@@ -12,16 +12,16 @@ Typical agent flow:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from blogger_http import build_blogger_service
 from blogger_quality import (
+    HARD_SKIP_RE,
     MIN_LABELS,
     TARGET_LABELS,
     is_hard_skip,
@@ -133,6 +133,71 @@ def find_empty_shell(service, blog_id: str) -> dict | None:
     return None
 
 
+def list_drafts(service, blog_id: str, limit: int = 50) -> list[dict]:
+    items: list[dict] = []
+    req = service.posts().list(
+        blogId=blog_id,
+        status="DRAFT",
+        maxResults=min(limit, 50),
+        fetchBodies=True,
+        view="ADMIN",
+    )
+    while req is not None and len(items) < limit:
+        resp = req.execute()
+        items.extend(resp.get("items") or [])
+        req = service.posts().list_next(req, resp)
+    return items[:limit]
+
+
+def find_reusable_draft(service, blog_id: str, title: str) -> dict | None:
+    """Pick a DRAFT to overwrite when insert is blocked (403/429).
+
+    Priority:
+      a) duplicate draft whose title already exists as LIVE
+      b) hard-skip (sports/ent) draft topic
+      c) oldest draft
+    """
+    drafts = list_drafts(service, blog_id)
+    if not drafts:
+        return None
+
+    live_titles = {t.strip() for t in recent_titles(service, blog_id, limit=50) if t.strip()}
+
+    dupes = []
+    hard = []
+    for d in drafts:
+        dt = (d.get("title") or "").strip()
+        if dt and dt in live_titles:
+            dupes.append(d)
+        elif HARD_SKIP_RE.search(dt) or HARD_SKIP_RE.search(d.get("content") or ""):
+            hard.append(d)
+
+    def _updated(p: dict) -> str:
+        return p.get("updated") or p.get("published") or ""
+
+    if dupes:
+        return sorted(dupes, key=_updated)[0]
+    if hard:
+        return sorted(hard, key=_updated)[0]
+    return sorted(drafts, key=_updated)[0]
+
+
+def fit_labels_for_blogger(labels: list[str]) -> list[list[str]]:
+    """Return label sets to try: 19 → 15 (Blogger may reject 20)."""
+    base = labels[:TARGET_LABELS]
+    tries = [base]
+    for n in (19, 18, 17, 16, 15):
+        trimmed = base[:n]
+        if trimmed and trimmed not in tries:
+            tries.append(trimmed)
+    return tries
+
+
+def now_kst_rfc3339() -> str:
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).isoformat()
+
+
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
     resp = (
         service.posts()
@@ -186,30 +251,79 @@ def build_content(body: str, thumb: str) -> str:
     return thumb_html + html
 
 
+def _apply_with_label_retries(service, blog_id: str, post_id: str | None, body: dict, labels: list[str]):
+    """patch/update or insert with label-count backoff on 400."""
+    last_exc: Exception | None = None
+    for labs in fit_labels_for_blogger(labels):
+        body = {**body, "labels": labs}
+        try:
+            if post_id:
+                return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+            return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            if "400" in msg or "Invalid" in msg or "label" in msg.lower():
+                print(f"LABEL_RETRY len={len(labs)} err={msg[:160]}")
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
-    shell = find_empty_shell(service, blog_id)
+    publish_at = now_kst_rfc3339()
+    print(f"PUBLISH_AT={publish_at}")
     body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
         "title": title,
         "content": content,
-        "labels": labels,
+        "labels": labels[:TARGET_LABELS],
+        "published": publish_at,
     }
+
+    # 1) empty LIVE/DRAFT shell first
+    shell = find_empty_shell(service, blog_id)
     if shell:
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
+        _apply_with_label_retries(service, blog_id, post_id, body, labels)
         if status == "DRAFT":
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+        return service.posts().get(blogId=blog_id, postId=post_id, view="ADMIN").execute()
 
+    # 2) insert only when no shell
     try:
-        return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
+        return _apply_with_label_retries(service, blog_id, None, body, labels)
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
-        raise SystemExit(0) from exc
+        msg = str(exc)
+        if "403" not in msg and "429" not in msg and "quota" not in msg.lower():
+            raise SystemExit(1) from exc
+
+    # 3) insert 403/429 → reuse a DRAFT (overwrite + publish now)
+    draft = find_reusable_draft(service, blog_id, title)
+    if not draft:
+        print("FALLBACK_REUSE_DRAFT=none")
+        print("생성/업데이트 없이 종료 (insert blocked and no reusable draft)")
+        raise SystemExit(1)
+
+    post_id = draft["id"]
+    print(f"FALLBACK_REUSE_DRAFT={post_id} title={(draft.get('title') or '')[:60]}")
+    body["published"] = publish_at
+    _apply_with_label_retries(service, blog_id, post_id, body, labels)
+    # Some Blogger clients need update+publish; set published again via patch then publish.
+    try:
+        service.posts().patch(
+            blogId=blog_id,
+            postId=post_id,
+            body={"published": publish_at, "title": title, "content": content, "labels": labels[:TARGET_LABELS]},
+        ).execute()
+    except Exception as exc:
+        print(f"PUBLISH_AT_PATCH_WARN={exc}")
+    return service.posts().publish(blogId=blog_id, postId=post_id).execute()
 
 
 def maybe_score_with_stats(category: str) -> None:
