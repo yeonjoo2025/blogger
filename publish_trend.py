@@ -300,22 +300,40 @@ def build_content(body: str, thumb: str) -> str:
 
 
 def fit_labels_for_blogger(labels: list[str], maximum: int = BLOGGER_LABEL_TRY_MAX) -> list[str]:
-    """Shrink label list for Blogger patch/update limits (prefer <=19)."""
+    """Shrink label list for Blogger patch/update limits (prefer <=19, short-first)."""
     maximum = max(MIN_LABELS, min(maximum, TARGET_LABELS))
-    return list(labels[:maximum])
+    # Short tokens pack more reliably under Blogger's label argument limits.
+    ordered = sorted({(lab or "").strip() for lab in labels if (lab or "").strip()}, key=lambda x: (len(x), x))
+    return ordered[:maximum]
 
 
 def _update_with_label_backoff(service, blog_id: str, post_id: str, body: dict) -> dict:
-    """Update post; shrink labels on 400."""
-    labels = list(body.get("labels") or [])
+    """Update post; shrink / repack labels on 400."""
+    labels = fit_labels_for_blogger(list(body.get("labels") or []), maximum=BLOGGER_LABEL_TRY_MAX)
     last_exc: Exception | None = None
+    attempts: list[list[str]] = []
     for max_n in (len(labels), 19, 18, 17, 16, 15):
         if max_n < MIN_LABELS:
             break
+        attempts.append(labels[:max_n])
+    # Also try dropping longest remaining tokens while keeping >=15.
+    cur = list(labels)
+    while len(cur) > MIN_LABELS:
+        longest_i = max(range(len(cur)), key=lambda i: len(cur[i]))
+        cur = cur[:longest_i] + cur[longest_i + 1 :]
+        if cur not in attempts:
+            attempts.append(list(cur))
+
+    seen: set[tuple[str, ...]] = set()
+    for labs in attempts:
+        key = tuple(labs)
+        if key in seen or len(labs) < MIN_LABELS:
+            continue
+        seen.add(key)
         trial = {
             "title": body["title"],
             "content": body["content"],
-            "labels": fit_labels_for_blogger(labels, maximum=max_n),
+            "labels": labs,
         }
         if body.get("published"):
             trial["published"] = body["published"]
@@ -325,8 +343,8 @@ def _update_with_label_backoff(service, blog_id: str, post_id: str, body: dict) 
         except Exception as exc:
             last_exc = exc
             msg = str(exc)
-            if "400" in msg or "label" in msg.lower():
-                print(f"LABEL_UPDATE_RETRY={max_n} err={msg[:160]}")
+            if "400" in msg or "label" in msg.lower() or "invalid argument" in msg.lower():
+                print(f"LABEL_UPDATE_RETRY={len(labs)} err={msg[:160]}")
                 continue
             raise
     assert last_exc is not None
@@ -512,7 +530,7 @@ def main() -> None:
         print(f"LABELS={labels}")
         raise SystemExit(0)
 
-    post = publish_or_patch(service, BLOG_ID, title, content, labels)
+    post = publish_or_patch(service, BLOG_ID, title, content, labels, live_titles=titles)
     url = post.get("url")
     post_id = post.get("id")
     final_labels = post.get("labels") or []
