@@ -8,8 +8,10 @@ from typing import Iterable
 
 MIN_BODY_CHARS = 2500
 MIN_LABELS = 15
-TARGET_LABELS = 20
+TARGET_LABELS = 19
 MAX_LABEL_CHARS_TOTAL = 180
+# Blogger patch/update rejects some 19-label sets by UTF-8 payload size.
+MAX_LABEL_UTF8_TOTAL = 210
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2
 
@@ -166,17 +168,22 @@ def sanitize_labels(
             seen.add(key)
             cleaned.insert(0, lab)
 
-    # Fit Blogger practical limits: count + total chars.
+    # Fit Blogger practical limits: count + total chars + UTF-8 bytes.
     out: list[str] = []
     total = 0
+    total_utf8 = 0
     for lab in cleaned:
         add = len(lab) + (1 if out else 0)
+        add_utf8 = len(lab.encode("utf-8")) + (1 if out else 0)
         if len(out) >= target:
             break
         if total + add > MAX_LABEL_CHARS_TOTAL:
             continue
+        if total_utf8 + add_utf8 > MAX_LABEL_UTF8_TOTAL:
+            continue
         out.append(lab)
         total += add
+        total_utf8 += add_utf8
 
     # Pad with short topical tokens if under minimum.
     pads = ["일정", "확인", "방법", "체크리스트", "공식", "신청", "비교", "가이드", "주의", "FAQ"]
@@ -186,12 +193,51 @@ def sanitize_labels(
         key = normalize_text(lab)
         if key in seen:
             continue
-        if total + len(lab) + 1 > MAX_LABEL_CHARS_TOTAL:
+        add = len(lab) + (1 if out else 0)
+        add_utf8 = len(lab.encode("utf-8")) + (1 if out else 0)
+        if total + add > MAX_LABEL_CHARS_TOTAL:
+            continue
+        if total_utf8 + add_utf8 > MAX_LABEL_UTF8_TOTAL:
             continue
         seen.add(key)
         out.append(lab)
-        total += len(lab) + 1
-    return out
+        total += add
+        total_utf8 += add_utf8
+    return fit_labels_for_blogger(out, target=target)
+
+
+def fit_labels_for_blogger(
+    labels: list[str],
+    *,
+    target: int = TARGET_LABELS,
+    minimum: int = MIN_LABELS,
+    max_chars: int = MAX_LABEL_CHARS_TOTAL,
+    max_utf8: int = MAX_LABEL_UTF8_TOTAL,
+) -> list[str]:
+    """Shrink/pad labels so Blogger patch/update accepts them (15~19)."""
+    labs = [x for x in labels if x][:target]
+    while labs and (
+        len(",".join(labs)) > max_chars or len(",".join(labs).encode("utf-8")) > max_utf8
+    ):
+        longest = max(labs, key=lambda x: (len(x.encode("utf-8")), len(x)))
+        labs.remove(longest)
+    pads = ["일정", "신청", "비교", "방법", "주의", "안내", "확인", "가이드", "공식", "FAQ"]
+    seen = {normalize_text(x) for x in labs}
+    for lab in pads:
+        if len(labs) >= target:
+            break
+        key = normalize_text(lab)
+        if key in seen:
+            continue
+        trial = labs + [lab]
+        joined = ",".join(trial)
+        if len(joined) > max_chars or len(joined.encode("utf-8")) > max_utf8:
+            continue
+        labs.append(lab)
+        seen.add(key)
+    if len(labs) < minimum:
+        return labs
+    return labs[:target]
 
 
 def title_ok(title: str, recent_titles: list[str] | None = None) -> tuple[bool, str]:
