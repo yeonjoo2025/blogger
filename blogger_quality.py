@@ -8,7 +8,8 @@ from typing import Iterable
 
 MIN_BODY_CHARS = 2500
 MIN_LABELS = 15
-TARGET_LABELS = 19  # Blogger patch/update can 400 on 20 labels
+TARGET_LABELS = 19  # Prefer 19; some draft patch/update paths 400 above 18
+MAX_LABELS_SAFE = 18
 MAX_LABEL_CHARS_TOTAL = 180
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2

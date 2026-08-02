@@ -22,6 +22,7 @@ from pathlib import Path
 
 from blogger_http import build_blogger_service
 from blogger_quality import (
+    MAX_LABELS_SAFE,
     MIN_LABELS,
     TARGET_LABELS,
     is_hard_skip,
@@ -291,6 +292,61 @@ def build_content(body: str, thumb: str) -> str:
     return thumb_html + html
 
 
+def _label_attempts(labels: list[str]) -> list[list[str]]:
+    """Blogger draft patch/update can 400 on 19+ labels; retry 19→18→15."""
+    seen: set[tuple[str, ...]] = set()
+    out: list[list[str]] = []
+    for n in (TARGET_LABELS, MAX_LABELS_SAFE, MIN_LABELS):
+        chunk = labels[:n]
+        if len(chunk) < MIN_LABELS:
+            continue
+        key = tuple(chunk)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(chunk)
+    return out
+
+
+def _apply_post(service, blog_id: str, post_id: str, body: dict, *, as_draft: bool) -> dict:
+    last_exc: Exception | None = None
+    labels = list(body.get("labels") or [])
+    for attempt in _label_attempts(labels):
+        payload = dict(body)
+        payload["labels"] = attempt
+        try:
+            if as_draft:
+                # update replaces full resource; patch is enough for draft shells.
+                service.posts().patch(blogId=blog_id, postId=post_id, body=payload).execute()
+                published = service.posts().publish(blogId=blog_id, postId=post_id).execute()
+            else:
+                published = service.posts().patch(
+                    blogId=blog_id, postId=post_id, body=payload
+                ).execute()
+            print(f"labels_attempt={len(attempt)}")
+            # If we had to shrink for draft write, try restoring fuller labels on LIVE.
+            if len(attempt) < len(labels[:TARGET_LABELS]):
+                for restore in _label_attempts(labels):
+                    if len(restore) <= len(attempt):
+                        continue
+                    try:
+                        published = service.posts().patch(
+                            blogId=blog_id,
+                            postId=post_id,
+                            body={"labels": restore},
+                        ).execute()
+                        print(f"labels_restored={len(restore)}")
+                        break
+                    except Exception as exc:  # noqa: PERF203
+                        print(f"LABEL_RESTORE_FAIL={exc}")
+            return published
+        except Exception as exc:  # noqa: PERF203
+            last_exc = exc
+            print(f"LABELS_RETRY_FAIL n={len(attempt)} err={exc}")
+    assert last_exc is not None
+    raise last_exc
+
+
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     publish_at = kst_now_rfc3339()
     body = {
@@ -309,10 +365,7 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
-        if status == "DRAFT":
-            service.posts().update(blogId=blog_id, postId=post_id, body=body).execute()
-            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+        return _apply_post(service, blog_id, post_id, body, as_draft=(status == "DRAFT"))
 
     # 2) Insert only when no reusable shell exists
     try:
@@ -333,9 +386,7 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
 
         post_id = draft["id"]
         print(f"FALLBACK_REUSE_DRAFT={post_id} title={(draft.get('title') or '')[:80]}")
-        service.posts().update(blogId=blog_id, postId=post_id, body=body).execute()
-        published = service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return published
+        return _apply_post(service, blog_id, post_id, body, as_draft=True)
 
 
 def maybe_score_with_stats(category: str) -> None:
