@@ -154,14 +154,9 @@ def list_drafts(service, blog_id: str, limit: int = 50) -> list[dict]:
     return items[:limit]
 
 
-def find_reusable_draft(service, blog_id: str, title: str) -> dict | None:
-    """Prefer duplicate-of-LIVE drafts, then hard-skip topics, then oldest draft."""
-    drafts = list_drafts(service, blog_id)
+def _pick_draft_by_priority(drafts: list[dict], live_titles: set[str]) -> dict | None:
     if not drafts:
         return None
-
-    live_titles = {t.strip() for t in recent_titles(service, blog_id, limit=50) if t.strip()}
-
     dup = [d for d in drafts if (d.get("title") or "").strip() in live_titles]
     if dup:
         dup.sort(key=lambda d: d.get("updated") or d.get("published") or "")
@@ -177,8 +172,70 @@ def find_reusable_draft(service, blog_id: str, title: str) -> dict | None:
         hard.sort(key=lambda d: d.get("updated") or d.get("published") or "")
         return hard[0]
 
-    drafts.sort(key=lambda d: d.get("updated") or d.get("published") or "")
-    return drafts[0]
+    # Prefer outdated template posts, else oldest draft.
+    mw = [d for d in drafts if "뭐길래" in (d.get("title") or "")]
+    pool = mw or drafts
+    pool.sort(key=lambda d: d.get("published") or d.get("updated") or "")
+    return pool[0]
+
+
+def list_live_posts(service, blog_id: str, limit: int = 50) -> list[dict]:
+    items: list[dict] = []
+    req = service.posts().list(
+        blogId=blog_id,
+        status="LIVE",
+        maxResults=min(limit, 50),
+        fetchBodies=False,
+        view="ADMIN",
+    )
+    while req is not None and len(items) < limit:
+        resp = req.execute()
+        items.extend(resp.get("items") or [])
+        req = service.posts().list_next(req, resp)
+    return items[:limit]
+
+
+def ensure_reusable_draft(service, blog_id: str) -> dict | None:
+    """Return a DRAFT to overwrite. If none exist, revert a disposable LIVE post."""
+    live_posts = list_live_posts(service, blog_id, limit=50)
+    live_titles = {((p.get("title") or "").strip()) for p in live_posts if (p.get("title") or "").strip()}
+
+    drafts = list_drafts(service, blog_id)
+    picked = _pick_draft_by_priority(drafts, live_titles)
+    if picked:
+        return picked
+
+    # No drafts: revert a LIVE post that is safe to replace (duplicate topic / hard-skip / 뭐길래).
+    candidates: list[dict] = []
+    for p in live_posts:
+        title = (p.get("title") or "").strip()
+        skip, _ = is_hard_skip(title, title)
+        if skip or "뭐길래" in title:
+            candidates.append(p)
+            continue
+        # Near-duplicate of a newer LIVE title (same leading keyword chunk).
+        head = re.split(r"[,，]", title, maxsplit=1)[0].strip()
+        if head and any(
+            head in (o.get("title") or "") and (o.get("id") != p.get("id")) for o in live_posts
+        ):
+            candidates.append(p)
+    if not candidates:
+        # Last resort: oldest LIVE post
+        candidates = sorted(live_posts, key=lambda d: d.get("published") or "")[:1]
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda d: d.get("published") or "")
+    target = candidates[0]
+    print(
+        f"REVERT_LIVE_TO_DRAFT={target.get('id')} title={(target.get('title') or '')[:80]}"
+    )
+    return service.posts().revert(blogId=blog_id, postId=target["id"]).execute()
+
+
+def find_reusable_draft(service, blog_id: str, title: str) -> dict | None:
+    """Prefer duplicate-of-LIVE drafts, then hard-skip topics, then oldest draft."""
+    return ensure_reusable_draft(service, blog_id)
 
 
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
