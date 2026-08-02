@@ -124,4 +124,4 @@ A. 따릉이는 기후동행패스(모두의카드)로 바꿔도 티머니GO에 
 3. **9월**: 기후동행패스/모두의카드로 전환, 단기권·청소년 안내는 FAQ 재확인  
 4. **공식 창구**: 서울시 02-120 / K-패스 031-427-4415 / 티머니 1644-0088  
 
-오늘 할 일 한 가지로 줄이면, **[운영종료 FAQ](https://news.seoul.go.kr/traffic/public/climatecard-faq/faq-stop)를 열고 내 카드 유형에 해당하는 일정 문단을 스크린샷으로 남기는 것**입니다.
+오늘 할 일 한 가지로 줄이면, [운영종료 FAQ](https://news.seoul.go.kr/traffic/public/climatecard-faq/faq-stop)를 열고 내 카드 유형에 해당하는 일정 문단을 스크린샷으로 남기는 것입니다.
