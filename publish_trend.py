@@ -256,17 +256,41 @@ def _publish_body(title: str, content: str, labels: list[str], blog_id: str) -> 
     }
 
 
+def fit_labels_for_blogger(labels: list[str]) -> list[str]:
+    """Shrink labels until Blogger accepts (19→15, UTF-8 byte budget)."""
+    from blogger_quality import MAX_LABEL_UTF8_BYTES
+
+    labs = list(labels[:TARGET_LABELS])
+    while labs and len(",".join(labs).encode("utf-8")) > MAX_LABEL_UTF8_BYTES:
+        # drop longest first
+        longest = max(range(len(labs)), key=lambda i: len(labs[i].encode("utf-8")))
+        labs.pop(longest)
+    if len(labs) > TARGET_LABELS:
+        labs = labs[:TARGET_LABELS]
+    return labs
+
+
 def reuse_draft_and_publish(
     service, blog_id: str, draft: dict, title: str, content: str, labels: list[str]
 ) -> dict:
     post_id = draft["id"]
     publish_at = now_rfc3339_kst()
-    body = _publish_body(title, content, labels, blog_id)
-    body["published"] = publish_at
-    print(f"FALLBACK_REUSE_DRAFT={post_id}")
-    print(f"PUBLISH_AT={publish_at}")
-    service.posts().update(blogId=blog_id, postId=post_id, body=body).execute()
-    return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+    # Prefer patch; full update can 400 on partial bodies.
+    last_err: Exception | None = None
+    for n in (TARGET_LABELS, 17, 15):
+        body = _publish_body(title, content, fit_labels_for_blogger(labels[:n]), blog_id)
+        body["published"] = publish_at
+        print(f"FALLBACK_REUSE_DRAFT={post_id}")
+        print(f"PUBLISH_AT={publish_at}")
+        print(f"LABELS_TRY={len(body['labels'])}")
+        try:
+            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+        except Exception as exc:
+            last_err = exc
+            print(f"DRAFT_PATCH_RETRY={exc}")
+            continue
+    raise SystemExit(f"DRAFT_REUSE_FAIL={last_err}")
 
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
