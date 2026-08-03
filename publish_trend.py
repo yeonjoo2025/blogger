@@ -224,29 +224,60 @@ def build_content(body: str, thumb: str) -> str:
     return thumb_html + html
 
 
+def fit_labels_for_blogger(labels: list[str]) -> list[list[str]]:
+    """Return label variants to try: 19 → 15 (Blogger may 400 on larger sets)."""
+    variants: list[list[str]] = []
+    for n in (19, 18, 17, 16, 15):
+        cut = labels[:n]
+        if cut and cut not in variants:
+            variants.append(cut)
+    return variants or [labels[:MIN_LABELS]]
+
+
+def _patch_or_update(service, blog_id: str, post_id: str, body: dict, *, use_update: bool = False):
+    if use_update:
+        return service.posts().update(blogId=blog_id, postId=post_id, body=body).execute()
+    return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+
+
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_empty_shell(service, blog_id)
     publish_at = _kst_now_rfc3339()
-    body = {
-        "kind": "blogger#post",
-        "blog": {"id": blog_id},
-        "title": title,
-        "content": content,
-        "labels": labels,
-        "published": publish_at,
-    }
     print(f"PUBLISH_AT={publish_at}")
+
+    def attempt(post_id: str | None, *, as_insert: bool, as_draft_publish: bool, use_update: bool = False):
+        last_exc: Exception | None = None
+        for labs in fit_labels_for_blogger(labels):
+            body = {
+                "kind": "blogger#post",
+                "blog": {"id": blog_id},
+                "title": title,
+                "content": content,
+                "labels": labs,
+                "published": publish_at,
+            }
+            try:
+                if as_insert:
+                    return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
+                assert post_id
+                _patch_or_update(service, blog_id, post_id, body, use_update=use_update)
+                if as_draft_publish:
+                    return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+                return service.posts().get(blogId=blog_id, postId=post_id, view="ADMIN").execute()
+            except Exception as exc:
+                last_exc = exc
+                print(f"LABELS_RETRY={len(labs)} err={str(exc)[:160]}")
+                continue
+        raise last_exc or RuntimeError("publish attempt failed")
+
     if shell:
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
-        if status == "DRAFT":
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
-            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+        return attempt(post_id, as_insert=False, as_draft_publish=(status == "DRAFT"))
 
     try:
-        return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
+        return attempt(None, as_insert=True, as_draft_publish=False)
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
         draft = find_reusable_draft(service, blog_id, title)
@@ -255,8 +286,7 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
             raise SystemExit(1) from exc
         post_id = draft["id"]
         print(f"FALLBACK_REUSE_DRAFT={post_id} title={(draft.get('title') or '')[:60]}")
-        service.posts().update(blogId=blog_id, postId=post_id, body=body).execute()
-        return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+        return attempt(post_id, as_insert=False, as_draft_publish=True, use_update=True)
 
 
 def maybe_score_with_stats(category: str) -> None:
