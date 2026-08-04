@@ -133,6 +133,69 @@ def find_empty_shell(service, blog_id: str) -> dict | None:
     return None
 
 
+def _list_posts(service, blog_id: str, status: str, limit: int = 50) -> list[dict]:
+    items: list[dict] = []
+    req = service.posts().list(
+        blogId=blog_id,
+        status=status,
+        maxResults=min(limit, 50),
+        fetchBodies=True,
+        view="ADMIN",
+    )
+    while req is not None and len(items) < limit:
+        resp = req.execute()
+        items.extend(resp.get("items") or [])
+        req = service.posts().list_next(req, resp)
+    return items[:limit]
+
+
+def find_reusable_draft(service, blog_id: str, title: str) -> dict | None:
+    """Pick a DRAFT to overwrite when insert is blocked (403/429) and no empty shell."""
+    live_titles = {
+        (p.get("title") or "").strip()
+        for p in _list_posts(service, blog_id, "LIVE", limit=50)
+    }
+    drafts = _list_posts(service, blog_id, "DRAFT", limit=50)
+    if not drafts:
+        return None
+
+    def published_key(post: dict) -> str:
+        return post.get("published") or post.get("updated") or ""
+
+    # a) duplicate draft whose title already exists LIVE
+    dupes = [
+        p
+        for p in drafts
+        if (p.get("title") or "").strip() and (p.get("title") or "").strip() in live_titles
+    ]
+    if dupes:
+        dupes.sort(key=published_key)
+        return dupes[0]
+
+    # b) hard-skip entertainment/sports drafts
+    hard = []
+    for p in drafts:
+        t = p.get("title") or ""
+        skip, _ = is_hard_skip(t, t)
+        if skip:
+            hard.append(p)
+    if hard:
+        hard.sort(key=published_key)
+        return hard[0]
+
+    # c) oldest draft
+    drafts.sort(key=published_key)
+    return drafts[0]
+
+
+def kst_now_rfc3339() -> str:
+    # Blogger expects RFC3339; use KST (+09:00) wall clock as required.
+    from datetime import timedelta, timezone
+
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).isoformat(timespec="seconds")
+
+
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
     resp = (
         service.posts()
@@ -186,6 +249,42 @@ def build_content(body: str, thumb: str) -> str:
     return thumb_html + html
 
 
+def _update_and_publish(
+    service,
+    blog_id: str,
+    post_id: str,
+    title: str,
+    content: str,
+    labels: list[str],
+) -> dict:
+    """Update a DRAFT/shell then publish, retrying with fewer labels on 400."""
+    last_err: Exception | None = None
+    for n in range(min(len(labels), 19), MIN_LABELS - 1, -1):
+        publish_at = kst_now_rfc3339()
+        body_pub = {
+            "kind": "blogger#post",
+            "blog": {"id": blog_id},
+            "title": title,
+            "content": content,
+            "labels": labels[:n],
+            "published": publish_at,
+        }
+        print(f"FALLBACK_REUSE_DRAFT={post_id}")
+        print(f"PUBLISH_AT={publish_at}")
+        try:
+            try:
+                service.posts().update(blogId=blog_id, postId=post_id, body=body_pub).execute()
+            except Exception:
+                service.posts().patch(blogId=blog_id, postId=post_id, body=body_pub).execute()
+            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+        except Exception as exc:
+            last_err = exc
+            print(f"DRAFT_REUSE_RETRY labels={n} err={exc}")
+            continue
+    assert last_err is not None
+    raise last_err
+
+
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_empty_shell(service, blog_id)
     body = {
@@ -200,16 +299,27 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
         if status == "DRAFT":
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
-            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+            return _update_and_publish(service, blog_id, post_id, title, content, labels)
         return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
 
     try:
         return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
     except Exception as exc:
+        msg = str(exc)
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
-        raise SystemExit(0) from exc
+        blocked = any(code in msg for code in ("403", "429", "quota", "Quota", "rateLimit"))
+        if not blocked:
+            raise
+        draft = find_reusable_draft(service, blog_id, title)
+        if not draft:
+            drafts = _list_posts(service, blog_id, "DRAFT", limit=50)
+            print(f"FALLBACK_REUSE_DRAFT=none draft_count={len(drafts)}")
+            print("생성/업데이트 없이 종료 (insert blocked and no reusable draft)")
+            print("ACTION_REQUIRED=Create empty Blogger DRAFT shells titled '신규' via blogger.com UI")
+            raise SystemExit(1) from exc
+        return _update_and_publish(
+            service, blog_id, draft["id"], title, content, labels
+        )
 
 
 def maybe_score_with_stats(category: str) -> None:
@@ -296,7 +406,9 @@ def main() -> None:
     if len(labels) < MIN_LABELS:
         print(f"SKIP_LABELS: only {len(labels)} after sanitize (need {MIN_LABELS}+)")
         raise SystemExit(0)
-    labels = labels[:TARGET_LABELS]
+    # Blogger may reject 20 labels on patch/update; keep 15~19.
+    max_labels = min(TARGET_LABELS, 19)
+    labels = labels[:max_labels]
 
     # Thumbnail gate
     if REQUIRE_AI_THUMB and not ALLOW_PILLOW:
