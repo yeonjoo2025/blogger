@@ -133,6 +133,92 @@ def find_empty_shell(service, blog_id: str) -> dict | None:
     return None
 
 
+def _kst_now_rfc3339() -> str:
+    # Blogger expects RFC3339; use explicit +09:00 for KST publish timestamp.
+    from datetime import timezone, timedelta
+
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).isoformat(timespec="seconds")
+
+
+def find_reusable_draft(service, blog_id: str, title: str) -> dict | None:
+    """Pick a DRAFT to overwrite when insert is blocked (403/429).
+
+    Priority:
+      a) draft whose title already exists as LIVE (duplicate leftover)
+      b) hard-skip sports/ent draft
+      c) oldest draft
+    """
+    resp = (
+        service.posts()
+        .list(blogId=blog_id, status="DRAFT", maxResults=50, fetchBodies=True, view="ADMIN")
+        .execute()
+    )
+    drafts = list(resp.get("items") or [])
+    if not drafts:
+        return None
+
+    live_titles = {t.strip() for t in recent_titles(service, blog_id, limit=50) if t.strip()}
+
+    dup = [
+        d
+        for d in drafts
+        if (d.get("title") or "").strip() in live_titles
+        or (d.get("title") or "").strip() == title.strip()
+    ]
+    if dup:
+        dup.sort(key=lambda d: d.get("updated") or d.get("published") or "")
+        return dup[0]
+
+    hard = []
+    for d in drafts:
+        t = d.get("title") or ""
+        skip, _ = is_hard_skip(t, t)
+        if skip:
+            hard.append(d)
+    if hard:
+        hard.sort(key=lambda d: d.get("updated") or d.get("published") or "")
+        return hard[0]
+
+    drafts.sort(key=lambda d: d.get("updated") or d.get("published") or "")
+    return drafts[0]
+
+
+def reuse_draft_and_publish(
+    service, blog_id: str, draft: dict, title: str, content: str, labels: list[str]
+) -> dict:
+    post_id = draft["id"]
+    publish_at = _kst_now_rfc3339()
+    print(f"FALLBACK_REUSE_DRAFT={post_id}")
+    print(f"PUBLISH_AT={publish_at}")
+    body = {
+        "kind": "blogger#post",
+        "blog": {"id": blog_id},
+        "title": title,
+        "content": content,
+        "labels": labels,
+        "published": publish_at,
+    }
+    # Shrink labels on 400 (Blogger sometimes rejects 20 labels).
+    last_exc: Exception | None = None
+    for limit in (19, 18, 17, 16, 15):
+        body["labels"] = labels[:limit]
+        try:
+            service.posts().update(blogId=blog_id, postId=post_id, body=body).execute()
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            if "400" in msg or "InvalidValue" in msg or "label" in msg.lower():
+                print(f"LABELS_RETRY={limit} err={msg[:160]}")
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+
+
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
     resp = (
         service.posts()
@@ -193,12 +279,15 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         "blog": {"id": blog_id},
         "title": title,
         "content": content,
-        "labels": labels,
+        "labels": labels[:19],
     }
     if shell:
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
+        publish_at = _kst_now_rfc3339()
+        body["published"] = publish_at
+        print(f"PUBLISH_AT={publish_at}")
         if status == "DRAFT":
             service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
@@ -208,7 +297,16 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
+        msg = str(exc)
+        # 403/429 (or quota/rate wording) → reuse an existing DRAFT instead of aborting.
+        if any(x in msg for x in ("403", "429", "quota", "Rate", "limit", "Limit")):
+            draft = find_reusable_draft(service, blog_id, title)
+            if draft:
+                return reuse_draft_and_publish(service, blog_id, draft, title, content, labels)
+        draft = find_reusable_draft(service, blog_id, title)
+        if draft:
+            return reuse_draft_and_publish(service, blog_id, draft, title, content, labels)
+        print("생성/업데이트 없이 종료 (insert blocked and no reusable draft)")
         raise SystemExit(0) from exc
 
 
