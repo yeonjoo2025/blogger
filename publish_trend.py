@@ -249,6 +249,42 @@ def build_content(body: str, thumb: str) -> str:
     return thumb_html + html
 
 
+def _update_and_publish(
+    service,
+    blog_id: str,
+    post_id: str,
+    title: str,
+    content: str,
+    labels: list[str],
+) -> dict:
+    """Update a DRAFT/shell then publish, retrying with fewer labels on 400."""
+    last_err: Exception | None = None
+    for n in range(min(len(labels), 19), MIN_LABELS - 1, -1):
+        publish_at = kst_now_rfc3339()
+        body_pub = {
+            "kind": "blogger#post",
+            "blog": {"id": blog_id},
+            "title": title,
+            "content": content,
+            "labels": labels[:n],
+            "published": publish_at,
+        }
+        print(f"FALLBACK_REUSE_DRAFT={post_id}")
+        print(f"PUBLISH_AT={publish_at}")
+        try:
+            try:
+                service.posts().update(blogId=blog_id, postId=post_id, body=body_pub).execute()
+            except Exception:
+                service.posts().patch(blogId=blog_id, postId=post_id, body=body_pub).execute()
+            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+        except Exception as exc:
+            last_err = exc
+            print(f"DRAFT_REUSE_RETRY labels={n} err={exc}")
+            continue
+    assert last_err is not None
+    raise last_err
+
+
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_empty_shell(service, blog_id)
     body = {
@@ -263,11 +299,7 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
         if status == "DRAFT":
-            publish_at = kst_now_rfc3339()
-            body_pub = {**body, "published": publish_at}
-            print(f"PUBLISH_AT={publish_at}")
-            service.posts().update(blogId=blog_id, postId=post_id, body=body_pub).execute()
-            return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+            return _update_and_publish(service, blog_id, post_id, title, content, labels)
         return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
 
     try:
@@ -280,20 +312,14 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
             raise
         draft = find_reusable_draft(service, blog_id, title)
         if not draft:
-            print("FALLBACK_REUSE_DRAFT=none")
+            drafts = _list_posts(service, blog_id, "DRAFT", limit=50)
+            print(f"FALLBACK_REUSE_DRAFT=none draft_count={len(drafts)}")
             print("생성/업데이트 없이 종료 (insert blocked and no reusable draft)")
+            print("ACTION_REQUIRED=Create empty Blogger DRAFT shells titled '신규' via blogger.com UI")
             raise SystemExit(1) from exc
-        post_id = draft["id"]
-        publish_at = kst_now_rfc3339()
-        print(f"FALLBACK_REUSE_DRAFT={post_id} title={(draft.get('title') or '')[:80]}")
-        print(f"PUBLISH_AT={publish_at}")
-        body_pub = {**body, "published": publish_at}
-        # Prefer update so published timestamp is applied, then publish.
-        try:
-            service.posts().update(blogId=blog_id, postId=post_id, body=body_pub).execute()
-        except Exception:
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body_pub).execute()
-        return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+        return _update_and_publish(
+            service, blog_id, draft["id"], title, content, labels
+        )
 
 
 def maybe_score_with_stats(category: str) -> None:
