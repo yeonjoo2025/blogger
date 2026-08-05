@@ -310,8 +310,10 @@ def main() -> None:
     archived = POSTS_DIR / f"{date}-{slug}.md"
     # Ensure archived md uses sanitized labels
     fm_labels = ", ".join(labels)
+    intent = (meta.get("intent") or "").strip()
+    intent_line = f"intent: {intent}\n" if intent else ""
     archived.write_text(
-        f"---\ntitle: {title}\nlabels: [{fm_labels}]\nkeyword: {keyword}\n---\n\n{body.strip()}\n",
+        f"---\ntitle: {title}\nlabels: [{fm_labels}]\nkeyword: {keyword}\n{intent_line}---\n\n{body.strip()}\n",
         encoding="utf-8",
     )
 
