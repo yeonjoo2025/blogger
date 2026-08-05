@@ -206,7 +206,14 @@ def build_content(body: str, thumb: str) -> str:
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_empty_shell(service, blog_id)
-    body = {
+    # Blogger patch is picky: omit kind/blog; keep labels within practical limits.
+    labels = labels[:15]
+    patch_body = {
+        "title": title,
+        "content": content,
+        "labels": labels,
+    }
+    insert_body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
         "title": title,
@@ -217,13 +224,20 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
+        try:
+            service.posts().patch(blogId=blog_id, postId=post_id, body=patch_body).execute()
+        except Exception as exc:
+            # Some drafts reject combined patch; apply field-wise.
+            print(f"PATCH_COMBINED_FAIL={exc}")
+            service.posts().patch(blogId=blog_id, postId=post_id, body={"title": title}).execute()
+            service.posts().patch(blogId=blog_id, postId=post_id, body={"labels": labels}).execute()
+            service.posts().patch(blogId=blog_id, postId=post_id, body={"content": content}).execute()
         if status == "DRAFT":
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+        return service.posts().get(blogId=blog_id, postId=post_id, view="ADMIN").execute()
 
     try:
-        return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
+        return service.posts().insert(blogId=blog_id, body=insert_body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
         print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
