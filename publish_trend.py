@@ -7,6 +7,9 @@ Typical agent flow:
 3) python3 publish_trend.py --slug {slug}
 4) If exit 2: GenerateImage → save plate → re-run publish_trend.py
 5) Script converts plate→jpg, git commit/push thumb, patches Blogger with CDN URL
+
+Shell reuse: any DRAFT (임시보관) may be overwritten then published LIVE;
+empty LIVE shells are fallback; never overwrite a non-empty LIVE post.
 """
 
 from __future__ import annotations
