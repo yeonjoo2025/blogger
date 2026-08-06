@@ -9,7 +9,10 @@ from typing import Iterable
 MIN_BODY_CHARS = 2500
 MIN_LABELS = 15
 TARGET_LABELS = 20
+# Blogger rejects oversized label payloads; Korean labels are multi-byte.
+# Keep a conservative UTF-8 budget (comma-joined) so 15~20 labels still fit.
 MAX_LABEL_CHARS_TOTAL = 180
+MAX_LABEL_UTF8_BYTES = 200
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2
 
@@ -166,27 +169,36 @@ def sanitize_labels(
             seen.add(key)
             cleaned.insert(0, lab)
 
-    # Fit Blogger practical limits: count + total chars.
+    # Fit Blogger practical limits: count + UTF-8 bytes of comma-joined labels.
+    def packed_bytes(labs: list[str]) -> int:
+        return len(",".join(labs).encode("utf-8"))
+
     out: list[str] = []
     total = 0
     for lab in cleaned:
         add = len(lab) + (1 if out else 0)
+        candidate = out + [lab]
         if len(out) >= target:
             break
         if total + add > MAX_LABEL_CHARS_TOTAL:
             continue
+        if packed_bytes(candidate) > MAX_LABEL_UTF8_BYTES:
+            continue
         out.append(lab)
         total += add
 
-    # Pad with short topical tokens if under minimum.
-    pads = ["일정", "확인", "방법", "체크리스트", "공식", "신청", "비교", "가이드", "주의", "FAQ"]
+    # Prefer shorter pads first so we can reach 15~20 under the byte budget.
+    pads = ["일정", "확인", "방법", "공식", "신청", "비교", "가이드", "주의", "FAQ", "체크리스트"]
     for lab in pads:
         if len(out) >= target:
             break
         key = normalize_text(lab)
         if key in seen:
             continue
+        candidate = out + [lab]
         if total + len(lab) + 1 > MAX_LABEL_CHARS_TOTAL:
+            continue
+        if packed_bytes(candidate) > MAX_LABEL_UTF8_BYTES:
             continue
         seen.add(key)
         out.append(lab)
