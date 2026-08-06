@@ -17,7 +17,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from blogger_http import build_blogger_service
@@ -249,7 +249,7 @@ def build_content(body: str, thumb: str) -> str:
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_reusable_shell(service, blog_id)
-    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
