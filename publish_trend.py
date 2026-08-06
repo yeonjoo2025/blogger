@@ -117,20 +117,48 @@ def push_thumb(slug: str, md_path: Path | None = None) -> str:
     return git_head_sha()
 
 
-def find_empty_shell(service, blog_id: str) -> dict | None:
-    for status in ("DRAFT", "LIVE"):
-        resp = (
-            service.posts()
-            .list(blogId=blog_id, status=status, maxResults=20, fetchBodies=True, view="ADMIN")
-            .execute()
-        )
-        for post in resp.get("items") or []:
+def _shell_text(post: dict) -> str:
+    content = post.get("content") or ""
+    return re.sub(r"<[^>]+>", "", content).strip()
+
+
+def find_reusable_shell(service, blog_id: str) -> dict | None:
+    """Reuse order: any DRAFT (factory/low-value first) → empty LIVE shell only."""
+    empty_titles = {"", "신규", "빈 포스트", "Untitled", "새 게시물", "새 포스트"}
+
+    draft_resp = (
+        service.posts()
+        .list(blogId=blog_id, status="DRAFT", maxResults=50, fetchBodies=True, view="ADMIN")
+        .execute()
+    )
+    drafts = list(draft_resp.get("items") or [])
+    if drafts:
+        def draft_rank(post: dict) -> tuple:
             title = (post.get("title") or "").strip()
-            content = post.get("content") or ""
-            text = re.sub(r"<[^>]+>", "", content).strip()
-            if title in {"", "신규", "빈 포스트", "Untitled", "새 게시물", "새 포스트"} or len(text) < 30:
-                return post
+            text = _shell_text(post)
+            factory = 0 if re.search(r"확인 방법|체크리스트", title) else 1
+            short = 0 if len(text) < 1200 else 1
+            return (factory, short, len(text), title)
+
+        drafts.sort(key=draft_rank)
+        return drafts[0]
+
+    live_resp = (
+        service.posts()
+        .list(blogId=blog_id, status="LIVE", maxResults=20, fetchBodies=True, view="ADMIN")
+        .execute()
+    )
+    for post in live_resp.get("items") or []:
+        title = (post.get("title") or "").strip()
+        text = _shell_text(post)
+        if title in empty_titles or len(text) < 30:
+            return post
     return None
+
+
+def find_empty_shell(service, blog_id: str) -> dict | None:
+    """Backward-compatible alias."""
+    return find_reusable_shell(service, blog_id)
 
 
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
@@ -187,7 +215,7 @@ def build_content(body: str, thumb: str) -> str:
 
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
-    shell = find_empty_shell(service, blog_id)
+    shell = find_reusable_shell(service, blog_id)
     body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
@@ -198,8 +226,10 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
     if shell:
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
-        print(f"USING_SHELL={post_id} status={status}")
+        print(f"USING_SHELL={post_id} status={status} old_title={(shell.get('title') or '')[:60]!r}")
         if status == "DRAFT":
+            # Reflect publish time on the reused draft shell.
+            body["published"] = datetime.now().astimezone().isoformat()
             service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
         return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
@@ -208,7 +238,7 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
+        print("생성/업데이트 없이 종료 (insert blocked and no reusable DRAFT/empty LIVE shell)")
         raise SystemExit(0) from exc
 
 
