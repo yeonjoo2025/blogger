@@ -117,20 +117,59 @@ def push_thumb(slug: str, md_path: Path | None = None) -> str:
     return git_head_sha()
 
 
-def find_empty_shell(service, blog_id: str) -> dict | None:
-    for status in ("DRAFT", "LIVE"):
-        resp = (
-            service.posts()
-            .list(blogId=blog_id, status=status, maxResults=20, fetchBodies=True, view="ADMIN")
-            .execute()
+EMPTY_TITLES = {"", "신규", "빈 포스트", "Untitled", "새 게시물", "새 포스트"}
+FACTORY_TITLE_RE = re.compile(r"확인\s*방법.*체크리스트|체크리스트$")
+
+
+def _post_text_len(post: dict) -> int:
+    content = post.get("content") or ""
+    return len(re.sub(r"<[^>]+>", "", content).strip())
+
+
+def _is_empty_shell(post: dict) -> bool:
+    title = (post.get("title") or "").strip()
+    return title in EMPTY_TITLES or _post_text_len(post) < 30
+
+
+def find_reusable_shell(service, blog_id: str) -> dict | None:
+    """Prefer reusable DRAFT (any body), then empty LIVE shell. Never overwrite healthy LIVE."""
+    draft_resp = (
+        service.posts()
+        .list(blogId=blog_id, status="DRAFT", maxResults=50, fetchBodies=True, view="ADMIN")
+        .execute()
+    )
+    drafts = list(draft_resp.get("items") or [])
+    if drafts:
+        def draft_score(p: dict) -> tuple:
+            title = (p.get("title") or "").strip()
+            text_len = _post_text_len(p)
+            factory = 0 if FACTORY_TITLE_RE.search(title) else 1
+            empty = 0 if _is_empty_shell(p) else 1
+            return (empty, factory, text_len)
+
+        drafts.sort(key=draft_score)
+        chosen = drafts[0]
+        print(
+            f"REUSE_DRAFT={chosen.get('id')} title={(chosen.get('title') or '')[:60]!r} "
+            f"textlen={_post_text_len(chosen)}"
         )
-        for post in resp.get("items") or []:
-            title = (post.get("title") or "").strip()
-            content = post.get("content") or ""
-            text = re.sub(r"<[^>]+>", "", content).strip()
-            if title in {"", "신규", "빈 포스트", "Untitled", "새 게시물", "새 포스트"} or len(text) < 30:
-                return post
+        return chosen
+
+    live_resp = (
+        service.posts()
+        .list(blogId=blog_id, status="LIVE", maxResults=20, fetchBodies=True, view="ADMIN")
+        .execute()
+    )
+    for post in live_resp.get("items") or []:
+        if _is_empty_shell(post):
+            print(f"REUSE_EMPTY_LIVE={post.get('id')}")
+            return post
     return None
+
+
+def find_empty_shell(service, blog_id: str) -> dict | None:
+    """Backward-compatible alias."""
+    return find_reusable_shell(service, blog_id)
 
 
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
@@ -187,7 +226,7 @@ def build_content(body: str, thumb: str) -> str:
 
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
-    shell = find_empty_shell(service, blog_id)
+    shell = find_reusable_shell(service, blog_id)
     body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
@@ -200,6 +239,8 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
         if status == "DRAFT":
+            # Refresh published timestamp so reused drafts surface as new LIVE posts.
+            body["published"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
             service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
         return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
@@ -208,7 +249,7 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
+        print("생성/업데이트 없이 종료 (insert blocked and no reusable DRAFT/empty LIVE shell)")
         raise SystemExit(0) from exc
 
 
