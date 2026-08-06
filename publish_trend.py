@@ -117,20 +117,66 @@ def push_thumb(slug: str, md_path: Path | None = None) -> str:
     return git_head_sha()
 
 
-def find_empty_shell(service, blog_id: str) -> dict | None:
-    for status in ("DRAFT", "LIVE"):
-        resp = (
-            service.posts()
-            .list(blogId=blog_id, status=status, maxResults=20, fetchBodies=True, view="ADMIN")
-            .execute()
-        )
-        for post in resp.get("items") or []:
+def _shell_text_len(post: dict) -> int:
+    content = post.get("content") or ""
+    return len(re.sub(r"<[^>]+>", "", content).strip())
+
+
+def _is_factory_title(title: str) -> bool:
+    return bool(re.search(r"확인 방법|체크리스트", title or ""))
+
+
+def find_reusable_shell(service, blog_id: str) -> dict | None:
+    """Reuse DRAFT (any body) first, then empty LIVE shells only.
+
+    Priority among DRAFTs:
+    1) empty/near-empty body
+    2) factory titles (확인 방법…체크리스트)
+    3) shorter body
+    Never overwrite a non-empty LIVE post.
+    """
+    empty_titles = {"", "신규", "빈 포스트", "Untitled", "새 게시물", "새 포스트"}
+
+    draft_resp = (
+        service.posts()
+        .list(blogId=blog_id, status="DRAFT", maxResults=50, fetchBodies=True, view="ADMIN")
+        .execute()
+    )
+    drafts = list(draft_resp.get("items") or [])
+    if drafts:
+
+        def draft_rank(post: dict) -> tuple:
             title = (post.get("title") or "").strip()
-            content = post.get("content") or ""
-            text = re.sub(r"<[^>]+>", "", content).strip()
-            if title in {"", "신규", "빈 포스트", "Untitled", "새 게시물", "새 포스트"} or len(text) < 30:
-                return post
+            n = _shell_text_len(post)
+            emptyish = 0 if (title in empty_titles or n < 80) else 1
+            factory = 0 if _is_factory_title(title) else 1
+            return (emptyish, factory, n)
+
+        drafts.sort(key=draft_rank)
+        chosen = drafts[0]
+        print(
+            f"REUSABLE_DRAFT={chosen.get('id')} title={(chosen.get('title') or '')[:60]!r} "
+            f"text_len={_shell_text_len(chosen)}"
+        )
+        return chosen
+
+    live_resp = (
+        service.posts()
+        .list(blogId=blog_id, status="LIVE", maxResults=20, fetchBodies=True, view="ADMIN")
+        .execute()
+    )
+    for post in live_resp.get("items") or []:
+        title = (post.get("title") or "").strip()
+        n = _shell_text_len(post)
+        if title in empty_titles or n < 30:
+            print(f"REUSABLE_EMPTY_LIVE={post.get('id')} title={title!r} text_len={n}")
+            return post
     return None
+
+
+def find_empty_shell(service, blog_id: str) -> dict | None:
+    """Backward-compatible alias."""
+    return find_reusable_shell(service, blog_id)
 
 
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
@@ -187,7 +233,7 @@ def build_content(body: str, thumb: str) -> str:
 
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
-    shell = find_empty_shell(service, blog_id)
+    shell = find_reusable_shell(service, blog_id)
     body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
@@ -208,7 +254,7 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
+        print("생성/업데이트 없이 종료 (insert blocked and no reusable DRAFT/empty LIVE shell)")
         raise SystemExit(0) from exc
 
 
