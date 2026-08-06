@@ -190,6 +190,19 @@ def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
     return [p.get("title") or "" for p in (resp.get("items") or [])]
 
 
+def existing_labels(service, blog_id: str, limit_posts: int = 100) -> list[str]:
+    """Collect labels already used on the blog to avoid global label-quota 400s."""
+    seen: dict[str, str] = {}
+    for status in ("LIVE", "DRAFT"):
+        for post in _list_posts(service, blog_id, status, limit=max(limit_posts // 2, 1)):
+            for lab in post.get("labels") or []:
+                key = re.sub(r"\s+", "", (lab or "").lower())
+                if key and key not in seen:
+                    seen[key] = lab
+    print(f"KNOWN_LABELS={len(seen)}")
+    return list(seen.values())
+
+
 def emit_thumb_required(slug: str, title: str) -> None:
     GEN_DIR.mkdir(parents=True, exist_ok=True)
     save_path = GEN_DIR / f"ai-thumb-{slug}.png"
@@ -236,7 +249,7 @@ def build_content(body: str, thumb: str) -> str:
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_reusable_shell(service, blog_id)
-    now_iso = datetime.now().astimezone().isoformat()
+    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
@@ -316,12 +329,14 @@ def main() -> None:
 
     service = build_blogger_service()
     titles = recent_titles(service, BLOG_ID)
+    known = existing_labels(service, BLOG_ID)
     result, labels, category = validate_post(
         title=title,
         body=body,
         labels=labels_in,
         recent_titles=titles,
         keyword=keyword,
+        known_labels=known,
     )
     for line in result.log_lines():
         print(line)
@@ -342,7 +357,12 @@ def main() -> None:
         raise SystemExit(0)
 
     if len(labels) < MIN_LABELS:
-        labels = sanitize_labels(labels + labels_in, keyword=keyword, category=category)
+        labels = sanitize_labels(
+            labels + labels_in,
+            keyword=keyword,
+            category=category,
+            known_labels=known,
+        )
     if len(labels) < MIN_LABELS:
         print(f"SKIP_LABELS: only {len(labels)} after sanitize (need {MIN_LABELS}+)")
         raise SystemExit(0)
