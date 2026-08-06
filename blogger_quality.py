@@ -121,9 +121,12 @@ def sanitize_labels(
     keyword: str = "",
     category: str = "",
     target: int = TARGET_LABELS,
+    known_labels: Iterable[str] | None = None,
+    max_new_labels: int = 2,
 ) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
+    known_map = {normalize_text(x): x for x in (known_labels or []) if x}
     for raw in labels:
         lab = re.sub(r"\s+", " ", (raw or "").strip())
         if not lab:
@@ -141,6 +144,9 @@ def sanitize_labels(
         key = normalize_text(lab)
         if key in seen:
             continue
+        # Prefer canonical spelling already present on the blog.
+        if key in known_map:
+            lab = known_map[key]
         seen.add(key)
         cleaned.append(lab)
 
@@ -162,14 +168,25 @@ def sanitize_labels(
                 extras.append(token)
     for lab in extras:
         key = normalize_text(lab)
+        if key in known_map:
+            lab = known_map[key]
         if key not in seen:
             seen.add(key)
             cleaned.insert(0, lab)
 
     # Fit Blogger practical limits: count + total chars.
+    # Also cap brand-new labels — blogs near the global label quota reject patch/insert.
     out: list[str] = []
     total = 0
-    for lab in cleaned:
+    new_used = 0
+    known_first = [lab for lab in cleaned if normalize_text(lab) in known_map]
+    unknown = [lab for lab in cleaned if normalize_text(lab) not in known_map]
+    ordered = known_first + unknown
+    for lab in ordered:
+        key = normalize_text(lab)
+        is_new = bool(known_map) and key not in known_map
+        if is_new and new_used >= max_new_labels:
+            continue
         add = len(lab) + (1 if out else 0)
         if len(out) >= target:
             break
@@ -177,15 +194,21 @@ def sanitize_labels(
             continue
         out.append(lab)
         total += add
+        if is_new:
+            new_used += 1
 
     # Pad with short topical tokens if under minimum.
-    pads = ["일정", "확인", "방법", "체크리스트", "공식", "신청", "비교", "가이드", "주의", "FAQ"]
+    pads = ["일정", "확인", "방법", "체크리스트", "공식", "신청", "비교", "가이드", "주의", "FAQ", "할인", "예약", "생활정보"]
     for lab in pads:
         if len(out) >= target:
             break
         key = normalize_text(lab)
         if key in seen:
             continue
+        if known_map and key not in known_map:
+            continue
+        if known_map and key in known_map:
+            lab = known_map[key]
         if total + len(lab) + 1 > MAX_LABEL_CHARS_TOTAL:
             continue
         seen.add(key)
@@ -316,6 +339,7 @@ def validate_post(
     labels: list[str],
     recent_titles: list[str] | None = None,
     keyword: str = "",
+    known_labels: Iterable[str] | None = None,
 ) -> tuple[QualityResult, list[str], str]:
     recent_titles = recent_titles or []
     category = classify_category(title, body)
@@ -329,7 +353,12 @@ def validate_post(
         result.ok = False
         result.errors.append(dup_reason)
 
-    clean_labels = sanitize_labels(labels, keyword=keyword or title, category=category)
+    clean_labels = sanitize_labels(
+        labels,
+        keyword=keyword or title,
+        category=category,
+        known_labels=known_labels,
+    )
     if len(clean_labels) < MIN_LABELS:
         result.ok = False
         result.errors.append(f"labels {len(clean_labels)} < {MIN_LABELS}")
