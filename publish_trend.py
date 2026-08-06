@@ -117,20 +117,62 @@ def push_thumb(slug: str, md_path: Path | None = None) -> str:
     return git_head_sha()
 
 
-def find_empty_shell(service, blog_id: str) -> dict | None:
-    for status in ("DRAFT", "LIVE"):
-        resp = (
-            service.posts()
-            .list(blogId=blog_id, status=status, maxResults=20, fetchBodies=True, view="ADMIN")
-            .execute()
+def _plain_text(content: str) -> str:
+    return re.sub(r"<[^>]+>", "", content or "").strip()
+
+
+def _is_empty_shell(post: dict) -> bool:
+    title = (post.get("title") or "").strip()
+    text = _plain_text(post.get("content") or "")
+    return title in {"", "신규", "빈 포스트", "Untitled", "새 게시물", "새 포스트"} or len(text) < 30
+
+
+def _draft_reuse_score(post: dict) -> tuple[int, int]:
+    """Lower tuple sorts first. Prefer factory/low-value/short DRAFT shells."""
+    title = (post.get("title") or "").strip()
+    text = _plain_text(post.get("content") or "")
+    factory = 0
+    if "확인 방법" in title and "체크리스트" in title:
+        factory = -3
+    elif "체크리스트" in title or "확인하는 법" in title:
+        factory = -2
+    # Prefer shorter / lower-label drafts as easier overwrite targets.
+    return (factory, len(text), len(post.get("labels") or []))
+
+
+def find_reusable_shell(service, blog_id: str) -> dict | None:
+    """Reuse priority: any DRAFT → empty LIVE shell only → else None (insert)."""
+    draft_resp = (
+        service.posts()
+        .list(blogId=blog_id, status="DRAFT", maxResults=50, fetchBodies=True, view="ADMIN")
+        .execute()
+    )
+    drafts = list(draft_resp.get("items") or [])
+    if drafts:
+        drafts.sort(key=_draft_reuse_score)
+        chosen = drafts[0]
+        print(
+            "REUSE_DRAFT="
+            f"{chosen.get('id')} title={(chosen.get('title') or '')[:60]!r} "
+            f"chars={len(_plain_text(chosen.get('content') or ''))}"
         )
-        for post in resp.get("items") or []:
-            title = (post.get("title") or "").strip()
-            content = post.get("content") or ""
-            text = re.sub(r"<[^>]+>", "", content).strip()
-            if title in {"", "신규", "빈 포스트", "Untitled", "새 게시물", "새 포스트"} or len(text) < 30:
-                return post
+        return chosen
+
+    live_resp = (
+        service.posts()
+        .list(blogId=blog_id, status="LIVE", maxResults=20, fetchBodies=True, view="ADMIN")
+        .execute()
+    )
+    for post in live_resp.get("items") or []:
+        if _is_empty_shell(post):
+            print(f"REUSE_EMPTY_LIVE={post.get('id')}")
+            return post
     return None
+
+
+def find_empty_shell(service, blog_id: str) -> dict | None:
+    """Backward-compatible alias used by older call sites."""
+    return find_reusable_shell(service, blog_id)
 
 
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
@@ -187,7 +229,7 @@ def build_content(body: str, thumb: str) -> str:
 
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
-    shell = find_empty_shell(service, blog_id)
+    shell = find_reusable_shell(service, blog_id)
     body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
@@ -200,15 +242,18 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
         if status == "DRAFT":
+            # Patch DRAFT body/labels first, then promote to LIVE.
+            # Do not send `published` here — Blogger rejects it on some DRAFT patches.
             service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
+        # Only empty LIVE shells reach here; never overwrite healthy live posts.
         return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
 
     try:
         return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
+        print("생성/업데이트 없이 종료 (insert blocked and no reusable DRAFT/empty LIVE shell)")
         raise SystemExit(0) from exc
 
 
