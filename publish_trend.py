@@ -240,8 +240,24 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         print(f"USING_SHELL={post_id} status={status}")
         if status == "DRAFT":
             # Refresh published timestamp so reused drafts surface as new LIVE posts.
-            body["published"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+            from datetime import timezone
+
+            body["published"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # Patch fields separately: some drafts reject oversized combined label payloads.
+            service.posts().patch(
+                blogId=blog_id,
+                postId=post_id,
+                body={
+                    "title": title,
+                    "content": content,
+                    "published": body["published"],
+                },
+            ).execute()
+            service.posts().patch(
+                blogId=blog_id,
+                postId=post_id,
+                body={"labels": labels},
+            ).execute()
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
         return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
 

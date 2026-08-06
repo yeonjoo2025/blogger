@@ -10,6 +10,8 @@ MIN_BODY_CHARS = 2500
 MIN_LABELS = 15
 TARGET_LABELS = 20
 MAX_LABEL_CHARS_TOTAL = 180
+# Blogger patch rejects oversized label payloads; UTF-8 bytes are the real gate.
+MAX_LABEL_UTF8_BYTES = 200
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2
 
@@ -166,19 +168,26 @@ def sanitize_labels(
             seen.add(key)
             cleaned.insert(0, lab)
 
-    # Fit Blogger practical limits: count + total chars.
+    # Prefer shorter tokens first so 15~20 labels fit Blogger's UTF-8 budget.
+    cleaned.sort(key=lambda lab: (len(lab.encode("utf-8")), len(lab), lab))
+
+    def fits(current: list[str], lab: str) -> bool:
+        joined = ",".join(current + [lab]) if current else lab
+        if len(joined) > MAX_LABEL_CHARS_TOTAL:
+            return False
+        if len(joined.encode("utf-8")) > MAX_LABEL_UTF8_BYTES:
+            return False
+        return True
+
     out: list[str] = []
-    total = 0
     for lab in cleaned:
-        add = len(lab) + (1 if out else 0)
         if len(out) >= target:
             break
-        if total + add > MAX_LABEL_CHARS_TOTAL:
+        if not fits(out, lab):
             continue
         out.append(lab)
-        total += add
 
-    # Pad with short topical tokens if under minimum.
+    # Pad with short topical tokens if under minimum/target.
     pads = ["일정", "확인", "방법", "체크리스트", "공식", "신청", "비교", "가이드", "주의", "FAQ"]
     for lab in pads:
         if len(out) >= target:
@@ -186,11 +195,10 @@ def sanitize_labels(
         key = normalize_text(lab)
         if key in seen:
             continue
-        if total + len(lab) + 1 > MAX_LABEL_CHARS_TOTAL:
+        if not fits(out, lab):
             continue
         seen.add(key)
         out.append(lab)
-        total += len(lab) + 1
     return out
 
 
