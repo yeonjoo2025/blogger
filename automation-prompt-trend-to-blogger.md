@@ -225,7 +225,7 @@ keyword: {원본 키워드}
 - 금지: 문장형 태그, `움직였습니다` 같은 본문 조각, 연도만, Corp/Inc, `정보성글` 남발
 - 총 글자 수 제한을 넘기면 긴 태그부터 탈락할 수 있음 → 짧고 선명한 토큰 위주
 - 목표 20개, 최소 15개 미만이면 발행 중단
-- insert / 빈 포스트 patch / draft update 모든 경로에 labels 포함
+- insert / DRAFT·빈 LIVE 셸 patch / draft→publish 모든 경로에 labels 포함
 - 발행 후 labels_count 로그 확인
 
 ════════════════════════════════════════
@@ -270,10 +270,14 @@ GenerateImage 제약:
 - `publish_from_posts.py` : MD→HTML (표/이미지/헤딩/리스트)
 - `publish_trend.py` : 선정 이후 발행 단일 진입점
 
-발행 우선순위:
-1) 빈 LIVE/DRAFT 셸이 있으면 patch/update 후 publish
-2) 셸이 없을 때만 posts.insert
-3) insert 403/429 이고 셸도 없으면 생성/수정 없이 종료
+발행 우선순위 (`publish_trend.find_reusable_shell`):
+1) **임시보관(DRAFT) 전부 재사용 가능** (빈 셸 아니어도 OK)
+   - 우선: 공장형 제목(`확인 방법…체크리스트`)·저가치·짧은 DRAFT
+   - `patch`(+ `published` 시각 반영) 후 반드시 `posts.publish` → **LIVE**
+2) 빈 LIVE 셸만 patch (라이브 정상 글은 덮어쓰지 않음)
+3) 위가 없을 때만 `posts.insert` (라이브)
+4) insert 403/429 이고 재사용 가능한 DRAFT/빈 LIVE도 없으면 생성/수정 없이 종료
+※ 초안(DRAFT)에서 멈추지 말 것. 선정 글은 LIVE `PUBLISHED_URL`까지가 완료.
 
 하루·속도 제한(기본값):
 - 실행당 1개
@@ -311,7 +315,7 @@ GenerateImage 제약:
   6) 본문에 즉시행동 + FAQ + 체크리스트 + 공식링크 실재
 - 유익도/하드필터/쿼터 미달이면 정상 종료로 간주하고
   `SKIP_LOW_USEFULNESS` / `SKIP_HARD_FILTER` / `SKIP_QUOTA` 로그만 남긴 채 발행하지 않음
-- insert 한도 소진이고 빈 포스트도 없으면
+- insert 한도 소진이고 재사용 가능한 DRAFT/빈 LIVE 셸도 없으면
   “생성/업데이트 없이 종료” 후 종료
 - 애매하면 억지 발행하지 말 것
 - 태그/썸네일 없이 “본문만 올림”으로 끝내지 말 것 (미완료)
