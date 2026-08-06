@@ -230,7 +230,6 @@ def build_content(body: str, thumb: str) -> str:
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_reusable_shell(service, blog_id)
-    now_iso = datetime.now().astimezone().isoformat()
     body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
@@ -243,8 +242,8 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
         if status == "DRAFT":
-            # Reflect publish time on patch, then promote DRAFT → LIVE.
-            body["published"] = now_iso
+            # Patch DRAFT body/labels first, then promote to LIVE.
+            # Do not send `published` here — Blogger rejects it on some DRAFT patches.
             service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
         # Only empty LIVE shells reach here; never overwrite healthy live posts.
