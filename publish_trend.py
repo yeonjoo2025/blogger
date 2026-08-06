@@ -117,20 +117,77 @@ def push_thumb(slug: str, md_path: Path | None = None) -> str:
     return git_head_sha()
 
 
-def find_empty_shell(service, blog_id: str) -> dict | None:
-    for status in ("DRAFT", "LIVE"):
-        resp = (
-            service.posts()
-            .list(blogId=blog_id, status=status, maxResults=20, fetchBodies=True, view="ADMIN")
-            .execute()
-        )
+EMPTY_TITLE_RE = re.compile(
+    r"^(신규|빈 포스트|Untitled|새 게시물|새 포스트)?$",
+    re.I,
+)
+FACTORY_TITLE_RE = re.compile(
+    r"확인 방법.*체크리스트|확인하는 법.*체크리스트"
+)
+
+
+def _plain_text(content: str) -> str:
+    return re.sub(r"<[^>]+>", "", content or "").strip()
+
+
+def _is_empty_shell(post: dict) -> bool:
+    title = (post.get("title") or "").strip()
+    text = _plain_text(post.get("content") or "")
+    return (not title) or bool(EMPTY_TITLE_RE.fullmatch(title)) or len(text) < 30
+
+
+def find_reusable_shell(service, blog_id: str) -> dict | None:
+    """Pick a post shell to overwrite.
+
+    Priority (operator policy):
+    1) Any DRAFT (임시보관) — prefer factory-title / shorter drafts
+    2) Empty LIVE shells only
+    """
+    drafts: list[tuple[int, int, str, dict]] = []
+    req = service.posts().list(
+        blogId=blog_id, status="DRAFT", maxResults=50, fetchBodies=True, view="ADMIN"
+    )
+    while req is not None:
+        resp = req.execute()
         for post in resp.get("items") or []:
             title = (post.get("title") or "").strip()
-            content = post.get("content") or ""
-            text = re.sub(r"<[^>]+>", "", content).strip()
-            if title in {"", "신규", "빈 포스트", "Untitled", "새 게시물", "새 포스트"} or len(text) < 30:
-                return post
+            text = _plain_text(post.get("content") or "")
+            score = 0
+            if _is_empty_shell(post):
+                score += 100
+            if FACTORY_TITLE_RE.search(title):
+                score += 40
+            if "뭐길래" in title:
+                score += 20
+            # Prefer shorter bodies (safer overwrite).
+            score += max(0, 30 - len(text) // 400)
+            drafts.append((score, len(text), post.get("updated") or "", post))
+        req = service.posts().list_next(req, resp)
+
+    if drafts:
+        drafts.sort(key=lambda x: (-x[0], x[1], x[2]))
+        chosen = drafts[0][3]
+        print(
+            f"REUSE_DRAFT={chosen.get('id')} score={drafts[0][0]} "
+            f"title={(chosen.get('title') or '')[:60]}"
+        )
+        return chosen
+
+    # Fallback: empty LIVE shells only (never overwrite a live article).
+    resp = (
+        service.posts()
+        .list(blogId=blog_id, status="LIVE", maxResults=50, fetchBodies=True, view="ADMIN")
+        .execute()
+    )
+    for post in resp.get("items") or []:
+        if _is_empty_shell(post):
+            print(f"REUSE_EMPTY_LIVE={post.get('id')}")
+            return post
     return None
+
+
+# Back-compat alias for older call sites / docs.
+find_empty_shell = find_reusable_shell
 
 
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
@@ -187,20 +244,25 @@ def build_content(body: str, thumb: str) -> str:
 
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
-    shell = find_empty_shell(service, blog_id)
+    shell = find_reusable_shell(service, blog_id)
+    # Reflect publish datetime (KST) on create/update.
+    published = datetime.now().astimezone().isoformat(timespec="seconds")
     body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
         "title": title,
         "content": content,
         "labels": labels,
+        "published": published,
     }
+    print(f"PUBLISH_DATETIME={published}")
     if shell:
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
         if status == "DRAFT":
             service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+            # DRAFT reuse always ends in LIVE publish.
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
         return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
 
@@ -208,7 +270,7 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
+        print("생성/업데이트 없이 종료 (insert blocked and no reusable DRAFT/empty LIVE shell)")
         raise SystemExit(0) from exc
 
 
