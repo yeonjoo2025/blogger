@@ -246,10 +246,11 @@ def build_content(body: str, thumb: str) -> str:
 
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_reusable_shell(service, blog_id)
-    now_iso = datetime.now().astimezone().isoformat()
+    now_iso = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S.000%z")
+    # Blogger accepts +0900; normalize to +09:00 if needed.
+    if len(now_iso) >= 5 and now_iso[-5] in "+-" and now_iso[-3] != ":":
+        now_iso = now_iso[:-2] + ":" + now_iso[-2:]
     body = {
-        "kind": "blogger#post",
-        "blog": {"id": blog_id},
         "title": title,
         "content": content,
         "labels": labels,
@@ -260,10 +261,10 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         status = (shell.get("status") or "").upper()
         old_title = (shell.get("title") or "")[:80]
         print(f"USING_SHELL={post_id} status={status} old_title={old_title}")
+        print(f"LABELS_UTF8={sum(len(x.encode('utf-8')) for x in labels)} labels_count={len(labels)}")
         if status == "DRAFT":
             service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
             published = service.posts().publish(blogId=blog_id, postId=post_id).execute()
-            # Ensure published timestamp reflects this run.
             try:
                 return (
                     service.posts()
@@ -279,7 +280,12 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
 
     try:
-        return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
+        insert_body = {
+            "kind": "blogger#post",
+            "blog": {"id": blog_id},
+            **body,
+        }
+        return service.posts().insert(blogId=blog_id, body=insert_body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
         print("생성/업데이트 없이 종료 (insert blocked and no reusable DRAFT/empty LIVE shell)")

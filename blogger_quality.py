@@ -9,7 +9,9 @@ from typing import Iterable
 MIN_BODY_CHARS = 2500
 MIN_LABELS = 15
 TARGET_LABELS = 20
+# Blogger rejects oversized label payloads; budget by UTF-8 bytes.
 MAX_LABEL_CHARS_TOTAL = 180
+MAX_LABEL_UTF8_BYTES = 190
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2
 
@@ -166,19 +168,31 @@ def sanitize_labels(
             seen.add(key)
             cleaned.insert(0, lab)
 
-    # Fit Blogger practical limits: count + total chars.
+    # Keep keyword/category extras first, then shorter topical tokens.
+    extras_set = {normalize_text(x) for x in extras}
+    head = [x for x in cleaned if normalize_text(x) in extras_set]
+    tail = [x for x in cleaned if normalize_text(x) not in extras_set]
+    tail.sort(key=lambda x: (len(x.encode("utf-8")), len(x), x))
+    ordered = head + tail
+
+    # Fit Blogger practical limits: count + UTF-8 bytes (+ legacy char budget).
     out: list[str] = []
-    total = 0
-    for lab in cleaned:
-        add = len(lab) + (1 if out else 0)
+    total_chars = 0
+    total_utf8 = 0
+    for lab in ordered:
+        utf8 = len(lab.encode("utf-8"))
+        add_chars = len(lab) + (1 if out else 0)
         if len(out) >= target:
             break
-        if total + add > MAX_LABEL_CHARS_TOTAL:
+        if total_chars + add_chars > MAX_LABEL_CHARS_TOTAL:
+            continue
+        if total_utf8 + utf8 > MAX_LABEL_UTF8_BYTES:
             continue
         out.append(lab)
-        total += add
+        total_chars += add_chars
+        total_utf8 += utf8
 
-    # Pad with short topical tokens if under minimum.
+    # Pad with short topical tokens if under minimum / target.
     pads = ["일정", "확인", "방법", "체크리스트", "공식", "신청", "비교", "가이드", "주의", "FAQ"]
     for lab in pads:
         if len(out) >= target:
@@ -186,11 +200,16 @@ def sanitize_labels(
         key = normalize_text(lab)
         if key in seen:
             continue
-        if total + len(lab) + 1 > MAX_LABEL_CHARS_TOTAL:
+        utf8 = len(lab.encode("utf-8"))
+        add_chars = len(lab) + (1 if out else 0)
+        if total_chars + add_chars > MAX_LABEL_CHARS_TOTAL:
+            continue
+        if total_utf8 + utf8 > MAX_LABEL_UTF8_BYTES:
             continue
         seen.add(key)
         out.append(lab)
-        total += len(lab) + 1
+        total_chars += add_chars
+        total_utf8 += utf8
     return out
 
 
