@@ -13,9 +13,13 @@ SCOPES = ["https://www.googleapis.com/auth/blogger"]
 TOKEN_PATH = Path("token.json")
 CLIENT_SECRET_PATH = Path("client_secret.json")
 
-# Cloud Agent Secrets tab → Runtime Secret / Environment Variable
-TOKEN_ENV_KEYS = ("BLOGGER_TOKEN_JSON", "TOKEN_JSON")
-CLIENT_SECRET_ENV_KEYS = ("BLOGGER_CLIENT_SECRET_JSON", "CLIENT_SECRET_JSON")
+# Cloud Agent Secrets tab -> Runtime Secret / Environment Variable
+TOKEN_ENV_KEYS = ("BLOGGER_TOKEN_JSON", "BLOGGER_TOKEN", "TOKEN_JSON")
+CLIENT_SECRET_ENV_KEYS = (
+    "BLOGGER_CLIENT_SECRET_JSON",
+    "BLOGGER_CLIENT_SECRET",
+    "CLIENT_SECRET_JSON",
+)
 
 
 def _first_env(*keys: str) -> str | None:
@@ -34,17 +38,17 @@ def ensure_token_file() -> Path:
     raw = _first_env(*TOKEN_ENV_KEYS)
     if not raw:
         raise SystemExit(
-            "token.json not found and no BLOGGER_TOKEN_JSON/TOKEN_JSON env secret.\n"
+            "token.json not found and no BLOGGER_TOKEN_JSON/BLOGGER_TOKEN/TOKEN_JSON env secret.\n"
             "Local: python get_token.py\n"
             "Cloud: Dashboard → Cloud Agents → Secrets (Personal)에 "
-            "BLOGGER_TOKEN_JSON = token.json 전체 내용 등록"
+            "BLOGGER_TOKEN_JSON 또는 BLOGGER_TOKEN = token.json 전체 내용 등록"
         )
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise SystemExit(
-            "BLOGGER_TOKEN_JSON/TOKEN_JSON is not valid JSON. "
+            "BLOGGER_TOKEN_JSON/BLOGGER_TOKEN/TOKEN_JSON is not valid JSON. "
             "Paste the full contents of token.json."
         ) from exc
 
@@ -64,14 +68,15 @@ def ensure_client_secret_file() -> Path:
     raw = _first_env(*CLIENT_SECRET_ENV_KEYS)
     if not raw:
         raise SystemExit(
-            "Missing client_secret*.json and no BLOGGER_CLIENT_SECRET_JSON env secret."
+            "Missing client_secret*.json and no BLOGGER_CLIENT_SECRET_JSON/"
+            "BLOGGER_CLIENT_SECRET env secret."
         )
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise SystemExit(
-            "BLOGGER_CLIENT_SECRET_JSON is not valid JSON."
+            "BLOGGER_CLIENT_SECRET_JSON/BLOGGER_CLIENT_SECRET is not valid JSON."
         ) from exc
 
     CLIENT_SECRET_PATH.write_text(json.dumps(data), encoding="utf-8")
