@@ -2,6 +2,16 @@
 
 트렌드 키워드 기반 Blogger 자동 포스팅용 저장소입니다.
 
+## Slack 자동화 프롬프트 (필수)
+
+Cursor Automation **Blogger → 네이버용 슬랙 초안** 프롬프트는 아래 파일을 **그대로** 사용합니다.
+
+- [`AUTOMATION_PROMPT.md`](./AUTOMATION_PROMPT.md)
+- 대시보드: https://cursor.com/automations/b8250dd3-84e5-11f1-a7d1-d6b4613131ce
+
+핸드폰 Slack → 네이버 붙여넣기 줄바꿈은 **U+2028만** 사용합니다.  
+(`format_latest_post_for_slack.for_naver_paste`)
+
 ## 로컬 설정
 
 ```bash
