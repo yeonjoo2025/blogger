@@ -117,11 +117,19 @@ def push_thumb(slug: str, md_path: Path | None = None) -> str:
     return git_head_sha()
 
 
+def _kst_now_rfc3339() -> str:
+    # Blogger expects RFC3339; use KST (+09:00) wall clock as publish stamp.
+    from datetime import timedelta, timezone
+
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).isoformat(timespec="seconds")
+
+
 def find_empty_shell(service, blog_id: str) -> dict | None:
     for status in ("DRAFT", "LIVE"):
         resp = (
             service.posts()
-            .list(blogId=blog_id, status=status, maxResults=20, fetchBodies=True, view="ADMIN")
+            .list(blogId=blog_id, status=status, maxResults=50, fetchBodies=True, view="ADMIN")
             .execute()
         )
         for post in resp.get("items") or []:
@@ -131,6 +139,76 @@ def find_empty_shell(service, blog_id: str) -> dict | None:
             if title in {"", "신규", "빈 포스트", "Untitled", "새 게시물", "새 포스트"} or len(text) < 30:
                 return post
     return None
+
+
+def list_drafts(service, blog_id: str, limit: int = 50) -> list[dict]:
+    items: list[dict] = []
+    req = service.posts().list(
+        blogId=blog_id,
+        status="DRAFT",
+        maxResults=min(limit, 50),
+        fetchBodies=True,
+        view="ADMIN",
+    )
+    while req is not None and len(items) < limit:
+        resp = req.execute()
+        items.extend(resp.get("items") or [])
+        req = service.posts().list_next(req, resp)
+    return items[:limit]
+
+
+def find_reusable_draft(service, blog_id: str, title: str) -> dict | None:
+    """Pick a DRAFT to overwrite when insert is blocked (403/429).
+
+    Priority:
+      a) draft whose title already exists as LIVE (duplicate draft)
+      b) hard-skip sports/entertainment draft
+      c) oldest draft
+    """
+    drafts = list_drafts(service, blog_id)
+    if not drafts:
+        return None
+
+    live_titles = {t.strip() for t in recent_titles(service, blog_id, limit=50) if t.strip()}
+
+    dup = []
+    hard = []
+    for d in drafts:
+        dt = (d.get("title") or "").strip()
+        if dt and dt in live_titles:
+            dup.append(d)
+            continue
+        skip, _ = is_hard_skip(dt, dt)
+        if skip:
+            hard.append(d)
+
+    def _published_key(p: dict) -> str:
+        return p.get("published") or p.get("updated") or p.get("id") or ""
+
+    if dup:
+        chosen = sorted(dup, key=_published_key)[0]
+        print(f"FALLBACK_REUSE_DRAFT={chosen.get('id')} reason=duplicate_live_title")
+        return chosen
+    if hard:
+        chosen = sorted(hard, key=_published_key)[0]
+        print(f"FALLBACK_REUSE_DRAFT={chosen.get('id')} reason=hard_skip_topic")
+        return chosen
+
+    chosen = sorted(drafts, key=_published_key)[0]
+    print(f"FALLBACK_REUSE_DRAFT={chosen.get('id')} reason=oldest_draft")
+    return chosen
+
+
+def fit_labels_for_blogger(labels: list[str], minimum: int = MIN_LABELS) -> list[list[str]]:
+    """Return label-size retry ladder: 19 → 15 (Blogger may 400 on 20)."""
+    ladder: list[list[str]] = []
+    for n in (19, 18, 17, 16, 15):
+        if n < minimum:
+            continue
+        trimmed = labels[:n]
+        if len(trimmed) >= minimum and trimmed not in ladder:
+            ladder.append(trimmed)
+    return ladder or [labels[:minimum]]
 
 
 def recent_titles(service, blog_id: str, limit: int = 20) -> list[str]:
@@ -186,30 +264,68 @@ def build_content(body: str, thumb: str) -> str:
     return thumb_html + html
 
 
+def _patch_with_label_retries(service, blog_id: str, post_id: str, body: dict) -> dict:
+    base_labels = list(body.get("labels") or [])
+    last_exc: Exception | None = None
+    for attempt_labels in fit_labels_for_blogger(base_labels):
+        body_try = dict(body)
+        body_try["labels"] = attempt_labels
+        try:
+            return service.posts().patch(blogId=blog_id, postId=post_id, body=body_try).execute()
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            if "400" in msg or "Invalid" in msg or "label" in msg.lower():
+                print(f"LABELS_RETRY={len(attempt_labels)} err={msg[:160]}")
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
 def publish_or_patch(service, blog_id: str, title: str, content: str, labels: list[str]) -> dict:
     shell = find_empty_shell(service, blog_id)
+    publish_at = _kst_now_rfc3339()
     body = {
         "kind": "blogger#post",
         "blog": {"id": blog_id},
         "title": title,
         "content": content,
-        "labels": labels,
+        "labels": labels[:TARGET_LABELS],
+        "published": publish_at,
     }
+    print(f"PUBLISH_AT={publish_at}")
+
     if shell:
         post_id = shell["id"]
         status = (shell.get("status") or "").upper()
         print(f"USING_SHELL={post_id} status={status}")
+        _patch_with_label_retries(service, blog_id, post_id, body)
         if status == "DRAFT":
-            service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
             return service.posts().publish(blogId=blog_id, postId=post_id).execute()
-        return service.posts().patch(blogId=blog_id, postId=post_id, body=body).execute()
+        return service.posts().get(blogId=blog_id, postId=post_id, view="ADMIN").execute()
 
     try:
         return service.posts().insert(blogId=blog_id, body=body, isDraft=False).execute()
     except Exception as exc:
         print(f"INSERT_FAIL={exc}")
-        print("생성/업데이트 없이 종료 (insert blocked and no empty shell)")
-        raise SystemExit(0) from exc
+        msg = str(exc)
+        # 403/429 (or quota-like) → reuse an existing DRAFT instead of aborting.
+        if "403" not in msg and "429" not in msg and "quota" not in msg.lower():
+            print("생성/업데이트 없이 종료 (insert blocked and no reusable draft path)")
+            raise SystemExit(0) from exc
+
+        draft = find_reusable_draft(service, blog_id, title)
+        if not draft:
+            print("생성/업데이트 없이 종료 (insert blocked and no reusable DRAFT)")
+            raise SystemExit(0) from exc
+
+        post_id = draft["id"]
+        publish_at = _kst_now_rfc3339()
+        body["published"] = publish_at
+        print(f"PUBLISH_AT={publish_at}")
+        _patch_with_label_retries(service, blog_id, post_id, body)
+        return service.posts().publish(blogId=blog_id, postId=post_id).execute()
 
 
 def maybe_score_with_stats(category: str) -> None:
