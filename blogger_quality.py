@@ -8,8 +8,9 @@ from typing import Iterable
 
 MIN_BODY_CHARS = 2500
 MIN_LABELS = 15
-TARGET_LABELS = 20
-MAX_LABEL_CHARS_TOTAL = 180
+TARGET_LABELS = 19  # Blogger may reject 20 labels on patch/update
+# Practical Blogger limit observed on this blog (~80 chars incl. separators).
+MAX_LABEL_CHARS_TOTAL = 80
 MWOGILLAE_RECENT_LIMIT = 10
 MWOGILLAE_MAX_IN_RECENT = 2
 
