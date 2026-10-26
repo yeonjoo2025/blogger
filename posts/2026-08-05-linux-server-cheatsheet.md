@@ -1,5 +1,5 @@
 ---
-title: 리눅스 서버 구축 명령어 가이드 총정리…압축·권한·SSH·방화벽 따라하기
+title: 리눅스 서버 셋업마다 검색하던 명령어 총정리…tar·chmod·SSH·rsync 복붙 가이드
 labels: [명령어, 서버, 생활정보, 리눅스, 서버구축, tar, chmod, ssh, rsync, 방화벽, ufw, systemd, crontab, Docker, 인프라]
 keyword: 리눅스 서버 명령어
 intent: how-to

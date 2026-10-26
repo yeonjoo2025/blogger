@@ -9,20 +9,26 @@ from pathlib import Path
 
 STATE_PATH = Path(".blogger_quota_state.json")
 
-# Defaults tuned for low early traffic (~3 PV/post).
+# Defaults tuned for quality-first early growth (fewer, higher-intent posts).
 DEFAULT_MIN_INTERVAL_MINUTES = int(os.environ.get("BLOGGER_MIN_INTERVAL_MINUTES", "240"))
-DEFAULT_MAX_PER_DAY = int(os.environ.get("BLOGGER_MAX_NEW_POSTS_PER_DAY", "6"))
-DEFAULT_MAX_PER_RUN = int(os.environ.get("BLOGGER_MAX_POSTS_PER_RUN", "1"))
+# AdSense recovery: publish 0 until low-value/min-content warning clears.
+# Raise via env after Google accepts the site again.
+DEFAULT_MAX_PER_DAY = int(os.environ.get("BLOGGER_MAX_NEW_POSTS_PER_DAY", "0"))
+DEFAULT_MAX_PER_RUN = int(os.environ.get("BLOGGER_MAX_POSTS_PER_RUN", "0"))
 
-# Daily category caps (sports blocked elsewhere).
+# Daily category caps — all zero while recovering.
 DAILY_CATEGORY_CAPS = {
     "sports_ent": 0,
-    "finance": int(os.environ.get("BLOGGER_DAILY_CAP_FINANCE", "2")),
-    "guide": int(os.environ.get("BLOGGER_DAILY_CAP_GUIDE", "3")),
-    "it": int(os.environ.get("BLOGGER_DAILY_CAP_IT", "2")),
-    "society": int(os.environ.get("BLOGGER_DAILY_CAP_SOCIETY", "2")),
-    "other": int(os.environ.get("BLOGGER_DAILY_CAP_OTHER", "1")),
+    "finance": int(os.environ.get("BLOGGER_DAILY_CAP_FINANCE", "0")),
+    "guide": int(os.environ.get("BLOGGER_DAILY_CAP_GUIDE", "0")),
+    "it": int(os.environ.get("BLOGGER_DAILY_CAP_IT", "0")),
+    "society": int(os.environ.get("BLOGGER_DAILY_CAP_SOCIETY", "0")),
+    "other": int(os.environ.get("BLOGGER_DAILY_CAP_OTHER", "0")),
 }
+
+# Minimum commercial-intent score (0~10) to publish; finance decision pieces need more.
+MIN_INTENT_SCORE = int(os.environ.get("BLOGGER_MIN_INTENT_SCORE", "4"))
+MIN_INTENT_SCORE_FINANCE = int(os.environ.get("BLOGGER_MIN_INTENT_SCORE_FINANCE", "5"))
 
 
 def _now() -> datetime:
@@ -63,7 +69,12 @@ def recent_publishes_today(state: dict) -> list[dict]:
     return out
 
 
-def can_publish(category: str, state: dict | None = None) -> tuple[bool, str]:
+def can_publish(
+    category: str,
+    state: dict | None = None,
+    *,
+    intent_score: int | None = None,
+) -> tuple[bool, str]:
     state = state if state is not None else load_state()
     now = _now()
 
@@ -85,6 +96,16 @@ def can_publish(category: str, state: dict | None = None) -> tuple[bool, str]:
     if cat_count >= cap:
         return False, f"category cap reached for {category} ({cap}/day)"
 
+    if intent_score is not None:
+        need_score = (
+            MIN_INTENT_SCORE_FINANCE if category == "finance" else MIN_INTENT_SCORE
+        )
+        if intent_score < need_score:
+            return (
+                False,
+                f"intent_score {intent_score} < {need_score} for {category}",
+            )
+
     return True, "ok"
 
 
@@ -94,6 +115,8 @@ def record_publish(
     title: str,
     url: str,
     post_id: str = "",
+    intent: str = "",
+    intent_score: int = 0,
     state: dict | None = None,
     path: Path = STATE_PATH,
 ) -> dict:
@@ -108,6 +131,8 @@ def record_publish(
             "title": title,
             "url": url,
             "post_id": post_id,
+            "intent": intent,
+            "intent_score": intent_score,
         }
     )
     # keep last 200

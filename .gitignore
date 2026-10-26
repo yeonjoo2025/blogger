@@ -7,5 +7,6 @@ token.json
 .DS_Store
 .blogger_quota_state.json
 .blogger_stats.json
+.blogger_performance.json
 pending_posts/
 generated_images/

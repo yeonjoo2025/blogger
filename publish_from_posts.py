@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from html import escape
 from pathlib import Path
 
 from blogger_http import build_blogger_service
 from blogger_quality import MIN_LABELS, sanitize_labels, validate_post
+
+REQUIRE_INTERNAL = os.environ.get("BLOGGER_REQUIRE_INTERNAL_LINKS", "1") != "0"
 
 POSTS_DIR = Path("posts")
 TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$")
@@ -39,8 +42,21 @@ def parse_labels(raw: str) -> list[str]:
     return [raw] if raw else []
 
 
+PRE_CODE_STYLE = (
+    "background:#1e1e1e;color:#e8e8e8;padding:14px 16px;overflow-x:auto;"
+    "border-radius:8px;font-size:13px;line-height:1.5;font-family:ui-monospace,"
+    "SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono','Courier New',monospace;"
+    "white-space:pre;display:block;margin:0.8em 0;"
+)
+INLINE_CODE_STYLE = (
+    "background:#f3f4f6;color:#111827;padding:1px 6px;border-radius:4px;"
+    "font-size:0.9em;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"
+    "'Liberation Mono','Courier New',monospace;"
+)
+
+
 def md_to_blogger_html(body: str) -> str:
-    """Convert markdown-ish body to Blogger HTML (headings, lists, tables, images)."""
+    """Convert markdown-ish body to Blogger HTML (headings, lists, tables, images, code)."""
     lines = body.splitlines()
     blocks: list[str] = []
     paragraph: list[str] = []
@@ -58,6 +74,25 @@ def md_to_blogger_html(body: str) -> str:
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
+
+        # fenced code block ```lang ... ```
+        fence = re.match(r"^```([\w+-]*)\s*$", stripped)
+        if fence:
+            flush_paragraph()
+            lang = fence.group(1) or ""
+            i += 1
+            code_lines: list[str] = []
+            while i < len(lines) and not re.match(r"^```\s*$", lines[i].strip()):
+                code_lines.append(lines[i])
+                i += 1
+            if i < len(lines):
+                i += 1  # closing ```
+            code_html = escape("\n".join(code_lines))
+            lang_attr = f' class="language-{escape(lang)}"' if lang else ""
+            blocks.append(
+                f'<pre style="{PRE_CODE_STYLE}"><code{lang_attr}>{code_html}</code></pre>'
+            )
+            continue
 
         # pipe table
         if (
@@ -106,12 +141,12 @@ def md_to_blogger_html(body: str) -> str:
 
         if stripped.startswith("### "):
             flush_paragraph()
-            blocks.append(f"<h3>{escape(stripped[4:].strip())}</h3>")
+            blocks.append(f"<h3>{inline_format(stripped[4:].strip())}</h3>")
             i += 1
             continue
         if stripped.startswith("## "):
             flush_paragraph()
-            blocks.append(f"<h2>{escape(stripped[3:].strip())}</h2>")
+            blocks.append(f"<h2>{inline_format(stripped[3:].strip())}</h2>")
             i += 1
             continue
 
@@ -133,6 +168,17 @@ def md_to_blogger_html(body: str) -> str:
             blocks.append(f"<ul>{''.join(items)}</ul>")
             continue
 
+        # numbered list: 1. 2. ...
+        if re.match(r"^\d+\.\s+", stripped):
+            flush_paragraph()
+            items = []
+            while i < len(lines) and re.match(r"^\d+\.\s+", lines[i].strip()):
+                item = re.sub(r"^\d+\.\s+", "", lines[i].strip())
+                items.append(f"<li>{inline_format(item)}</li>")
+                i += 1
+            blocks.append(f"<ol>{''.join(items)}</ol>")
+            continue
+
         paragraph.append(stripped)
         i += 1
 
@@ -143,12 +189,25 @@ def md_to_blogger_html(body: str) -> str:
 
 
 def inline_format(text: str) -> str:
+    """Format inline markdown: links, `code`, **bold**."""
+
     def repl_link(match: re.Match[str]) -> str:
         label = escape(match.group(1))
         url = escape(match.group(2), quote=True)
         return f'<a href="{url}">{label}</a>'
 
+    # Protect inline code first so * / links inside code stay literal.
+    code_slots: list[str] = []
+
+    def stash_code(match: re.Match[str]) -> str:
+        code_slots.append(
+            f'<code style="{INLINE_CODE_STYLE}">{escape(match.group(1))}</code>'
+        )
+        return f"\x00CODE{len(code_slots) - 1}\x00"
+
+    text = re.sub(r"`([^`]+)`", stash_code, text)
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", repl_link, text)
+
     parts: list[str] = []
     last = 0
     for match in re.finditer(r"\*\*([^*]+)\*\*", text):
@@ -156,7 +215,11 @@ def inline_format(text: str) -> str:
         parts.append(f"<strong>{escape(match.group(1))}</strong>")
         last = match.end()
     parts.append(escape_keep_anchors(text[last:]))
-    return "".join(parts)
+    out = "".join(parts)
+
+    for idx, html in enumerate(code_slots):
+        out = out.replace(f"\x00CODE{idx}\x00", html)
+    return out
 
 
 def escape_keep_anchors(text: str) -> str:
@@ -186,7 +249,15 @@ def publish_file(service, blog_id: str, path: Path, draft: bool) -> dict:
     if not title:
         raise SystemExit(f"Missing title frontmatter: {path}")
     labels = sanitize_labels(parse_labels(meta.get("labels", "")), keyword=title)
-    result, labels, _cat = validate_post(title=title, body=body, labels=labels, keyword=title)
+    intent = (meta.get("intent") or "").strip()
+    result, labels, _cat = validate_post(
+        title=title,
+        body=body,
+        labels=labels,
+        keyword=meta.get("keyword") or title,
+        intent=intent,
+        require_internal_links=REQUIRE_INTERNAL,
+    )
     for line in result.log_lines():
         print(line)
     if not result.ok:

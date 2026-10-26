@@ -24,12 +24,15 @@ from blogger_http import build_blogger_service
 from blogger_quality import (
     MIN_LABELS,
     TARGET_LABELS,
+    VALID_INTENTS,
+    classify_intent,
+    commercial_intent_score,
     is_hard_skip,
     sanitize_labels,
     validate_post,
 )
-from blogger_quota import can_publish, load_state, record_publish
-from fetch_stats import category_boost, load_stats, save_stats
+from blogger_quota import can_publish, record_publish
+from fetch_stats import load_stats, save_stats, selection_score
 from publish_from_posts import md_to_blogger_html, parse_frontmatter, parse_labels
 
 BLOG_ID = os.environ.get("BLOGGER_BLOG_ID", "4736025457821775813")
@@ -41,6 +44,8 @@ POSTS_DIR = Path("posts")
 REQUIRE_AI_THUMB = os.environ.get("BLOGGER_REQUIRE_AI_THUMB", "1") != "0"
 ALLOW_PILLOW = os.environ.get("BLOGGER_ALLOW_PILLOW_THUMB", "") == "1"
 AUTO_GIT_PUSH = os.environ.get("BLOGGER_AUTO_GIT_PUSH", "1") != "0"
+REQUIRE_INTERNAL = os.environ.get("BLOGGER_REQUIRE_INTERNAL_LINKS", "1") != "0"
+MIN_SELECTION_SCORE = int(os.environ.get("BLOGGER_MIN_SELECTION_SCORE", "6"))
 
 
 def slugify(text: str) -> str:
@@ -212,15 +217,43 @@ def publish_or_patch(service, blog_id: str, title: str, content: str, labels: li
         raise SystemExit(0) from exc
 
 
-def maybe_score_with_stats(category: str) -> None:
+def maybe_score_with_stats(
+    *,
+    category: str,
+    intent: str,
+    keyword: str,
+    title: str,
+) -> dict:
     stats = load_stats()
-    boost = category_boost(category, stats)
+    score = selection_score(
+        category=category, intent=intent, keyword=keyword, title=title, stats=stats
+    )
     pv = (stats.get("pageviews") or {}).get("ALL_TIME")
+    hints = stats.get("selection_hints") or {}
     print(f"STATS_PAGEVIEWS_ALL={pv}")
-    print(f"STATS_CATEGORY_BOOST={category}:{boost}")
+    print(f"SELECTION_SCORE={score}")
     print(f"STATS_CATEGORY_COUNTS={(stats.get('content') or {}).get('category_counts')}")
-    if boost <= -5:
-        raise SystemExit(f"SKIP_LOW_STATS_CATEGORY: {category}")
+    print(f"STATS_INTENT_COUNTS={(stats.get('content') or {}).get('intent_counts')}")
+    print(f"PREFER_PATTERNS={hints.get('prefer_patterns')}")
+    refresh = hints.get("refresh_first") or []
+    if refresh:
+        print(f"REFRESH_HINT_TOP={refresh[0].get('title', '')[:80]}")
+    if category == "sports_ent" or score < MIN_SELECTION_SCORE:
+        raise SystemExit(
+            f"SKIP_LOW_SELECTION_SCORE: {score} < {MIN_SELECTION_SCORE} "
+            f"(category={category}, intent={intent})"
+        )
+    return stats
+
+
+def suggest_internal_links(stats: dict, limit: int = 5) -> None:
+    urls = (stats.get("content") or {}).get("recent_urls") or []
+    if not urls:
+        return
+    print("INTERNAL_LINK_CANDIDATES_BEGIN")
+    for item in urls[:limit]:
+        print(f"- {item.get('title')}: {item.get('url')}")
+    print("INTERNAL_LINK_CANDIDATES_END")
 
 
 def main() -> None:
@@ -258,6 +291,12 @@ def main() -> None:
     title = meta["title"]
     keyword = args.keyword or meta.get("keyword") or title
     labels_in = parse_labels(meta.get("labels", ""))
+    intent = (meta.get("intent") or "").strip().lower() or classify_intent(
+        keyword, title, body
+    )
+    if intent not in VALID_INTENTS:
+        print(f"SKIP_BAD_INTENT: {intent}")
+        raise SystemExit(0)
 
     skip, why = is_hard_skip(keyword, title)
     if skip:
@@ -272,23 +311,33 @@ def main() -> None:
         labels=labels_in,
         recent_titles=titles,
         keyword=keyword,
+        intent=intent,
+        require_internal_links=REQUIRE_INTERNAL,
     )
     for line in result.log_lines():
         print(line)
     print(f"PICK_KEYWORD={keyword}")
     print(f"PICK_CATEGORY={category}")
+    print(f"PICK_INTENT={intent}")
     print(f"LABELS_COUNT={len(labels)}")
 
-    maybe_score_with_stats(category)
+    stats = maybe_score_with_stats(
+        category=category, intent=intent, keyword=keyword, title=title
+    )
+    suggest_internal_links(stats)
 
-    ok_quota, quota_reason = can_publish(category)
+    intent_score = result.intent_score or commercial_intent_score(keyword, title, body)
+    ok_quota, quota_reason = can_publish(category, intent_score=intent_score)
     print(f"QUOTA_CHECK={quota_reason}")
+    print(f"INTENT_SCORE={intent_score}")
     if not ok_quota:
         print(f"SKIP_QUOTA: {quota_reason}")
         raise SystemExit(0)
 
     if not result.ok:
         print(f"SKIP_LOW_USEFULNESS: {keyword} score={result.score}")
+        for err in result.errors:
+            print(f"QUALITY_ERROR={err}")
         raise SystemExit(0)
 
     if len(labels) < MIN_LABELS:
@@ -311,7 +360,8 @@ def main() -> None:
     # Ensure archived md uses sanitized labels
     fm_labels = ", ".join(labels)
     archived.write_text(
-        f"---\ntitle: {title}\nlabels: [{fm_labels}]\nkeyword: {keyword}\n---\n\n{body.strip()}\n",
+        f"---\ntitle: {title}\nlabels: [{fm_labels}]\nkeyword: {keyword}\n"
+        f"intent: {intent}\n---\n\n{body.strip()}\n",
         encoding="utf-8",
     )
 
@@ -343,7 +393,14 @@ def main() -> None:
         print(f"QUALITY_ERROR=labels_count {len(final_labels)} < {MIN_LABELS}")
         raise SystemExit(1)
 
-    record_publish(category=category, title=title, url=url or "", post_id=post_id or "")
+    record_publish(
+        category=category,
+        title=title,
+        url=url or "",
+        post_id=post_id or "",
+        intent=intent,
+        intent_score=intent_score,
+    )
     print("quality ok")
     # cleanup pending
     pending_path = PENDING_DIR / f"{slug}.md"
